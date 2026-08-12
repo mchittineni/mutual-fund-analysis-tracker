@@ -31,7 +31,7 @@ from src import config
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA_STATEMENTS = (
     """
@@ -41,6 +41,8 @@ _SCHEMA_STATEMENTS = (
         fund_house       TEXT,
         scheme_type      TEXT,
         scheme_category  TEXT,
+        isin_growth      TEXT,
+        isin_reinvest    TEXT,
         data_source      TEXT NOT NULL DEFAULT 'unknown',
         updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
     )
@@ -70,6 +72,9 @@ _SCHEMA_STATEMENTS = (
     """,
     "CREATE INDEX IF NOT EXISTS idx_nav_scheme_date ON nav_history (scheme_code, date DESC)",
     "CREATE INDEX IF NOT EXISTS idx_nav_date ON nav_history (date)",
+    # The catalogue holds ~14,000 schemes, so category and AMC lookups need indexes.
+    "CREATE INDEX IF NOT EXISTS idx_scheme_category ON scheme_info (scheme_category)",
+    "CREATE INDEX IF NOT EXISTS idx_scheme_house ON scheme_info (fund_house)",
     "CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
 )
 
@@ -121,6 +126,9 @@ def setup_database(db_path: str | Path | None = None) -> sqlite3.Connection:
         ("scheme_info", "updated_at", "TEXT"),
         ("nav_history", "data_source", "TEXT NOT NULL DEFAULT 'unknown'"),
         ("nav_history", "updated_at", "TEXT"),
+        # v2 -> v3: ISINs from the full-universe catalogue.
+        ("scheme_info", "isin_growth", "TEXT"),
+        ("scheme_info", "isin_reinvest", "TEXT"),
     ):
         if column not in _existing_columns(conn, table):
             logger.info("Migrating %s: adding column %s", table, column)
@@ -219,6 +227,121 @@ def upsert_nav_records(
     inserted = _row_count(conn) - rows_before
     updated = (conn.total_changes - changes_before) - inserted
     return inserted, max(updated, 0)
+
+
+def upsert_catalogue(conn: sqlite3.Connection, entries: Sequence[object]) -> int:
+    """Bulk-upsert `catalogue.CatalogueEntry` rows into `scheme_info`.
+
+    Written as one `executemany` because the catalogue is ~14,000 rows: a
+    per-row `upsert_scheme_info()` loop would issue 14,000 statements per run.
+
+    Existing values are preserved when the incoming field is NULL, so a later
+    per-scheme detail fetch can enrich a catalogue row without a catalogue
+    refresh then blanking it again.
+    """
+    if not entries:
+        return 0
+    timestamp = _utc_now()
+    rows = [
+        (
+            str(entry.scheme_code),
+            entry.scheme_name,
+            entry.fund_house,
+            entry.scheme_type,
+            entry.scheme_category,
+            entry.isin_growth,
+            entry.isin_reinvest,
+            "amfi",
+            timestamp,
+        )
+        for entry in entries
+    ]
+    before = conn.total_changes
+    conn.executemany(
+        """
+        INSERT INTO scheme_info
+            (scheme_code, scheme_name, fund_house, scheme_type, scheme_category,
+             isin_growth, isin_reinvest, data_source, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(scheme_code) DO UPDATE SET
+            scheme_name     = excluded.scheme_name,
+            fund_house      = COALESCE(excluded.fund_house, scheme_info.fund_house),
+            scheme_type     = COALESCE(excluded.scheme_type, scheme_info.scheme_type),
+            scheme_category = COALESCE(excluded.scheme_category, scheme_info.scheme_category),
+            isin_growth     = COALESCE(excluded.isin_growth, scheme_info.isin_growth),
+            isin_reinvest   = COALESCE(excluded.isin_reinvest, scheme_info.isin_reinvest),
+            data_source     = excluded.data_source,
+            updated_at      = excluded.updated_at
+        """,
+        rows,
+    )
+    conn.commit()
+    return conn.total_changes - before
+
+
+def catalogue_stats(db_path: str | Path | None = None) -> dict[str, int]:
+    """Headline counts for the catalogue, for reports and the dashboard."""
+    with connection(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS schemes,
+                   COUNT(DISTINCT scheme_category) AS categories,
+                   COUNT(DISTINCT fund_house) AS fund_houses
+              FROM scheme_info
+            """
+        ).fetchone()
+        analysable = conn.execute(
+            """
+            SELECT COUNT(*) FROM (
+                SELECT scheme_code FROM nav_history
+                 GROUP BY scheme_code HAVING COUNT(*) >= ?
+            )
+            """,
+            (config.MIN_OBSERVATIONS,),
+        ).fetchone()[0]
+    return {
+        "schemes": int(row["schemes"]),
+        "categories": int(row["categories"]),
+        "fund_houses": int(row["fund_houses"]),
+        "analysable": int(analysable),
+    }
+
+
+def search_schemes(
+    db_path: str | Path | None = None,
+    *,
+    query: str | None = None,
+    category: str | None = None,
+    fund_house: str | None = None,
+    with_history_only: bool = False,
+    limit: int = 200,
+) -> pd.DataFrame:
+    """Search the catalogue. Powers the dashboard's fund browser."""
+    sql = """
+        SELECT s.scheme_code, s.scheme_name, s.fund_house, s.scheme_type, s.scheme_category,
+               COUNT(n.date) AS observations, MAX(n.date) AS last_date
+          FROM scheme_info s
+          LEFT JOIN nav_history n ON n.scheme_code = s.scheme_code
+         WHERE 1 = 1
+    """
+    params: list[object] = []
+    if query:
+        sql += " AND s.scheme_name LIKE ?"
+        params.append(f"%{query}%")
+    if category:
+        sql += " AND s.scheme_category = ?"
+        params.append(category)
+    if fund_house:
+        sql += " AND s.fund_house = ?"
+        params.append(fund_house)
+    sql += " GROUP BY s.scheme_code"
+    if with_history_only:
+        sql += " HAVING observations >= ?"
+        params.append(config.MIN_OBSERVATIONS)
+    sql += " ORDER BY observations DESC, s.scheme_name LIMIT ?"
+    params.append(limit)
+    with connection(db_path) as conn:
+        return pd.read_sql_query(sql, conn, params=params)
 
 
 def start_run(conn: sqlite3.Connection, schemes: Iterable[str]) -> int:

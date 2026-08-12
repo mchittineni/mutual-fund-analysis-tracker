@@ -48,6 +48,8 @@ class FakeMftool:
 def fake_mftool(monkeypatch):
     def install(instance: FakeMftool) -> FakeMftool:
         monkeypatch.setattr(fetch_amfi_data, "MFTOOL_AVAILABLE", True)
+        # The reachability probe is real network I/O; tests stay hermetic.
+        monkeypatch.setattr(fetch_amfi_data, "amfi_reachable", lambda *_a, **_k: True)
         monkeypatch.setattr(fetch_amfi_data, "Mftool", lambda *_a, **_k: instance)
         return instance
 
@@ -101,6 +103,59 @@ def test_retries_exhausted_raises_fetch_error():
             max_retries=3,
             sleep=lambda _: None,
         )
+
+
+# --- reachability preflight ------------------------------------------------
+
+
+def test_unreachable_amfi_fails_fast_instead_of_hanging(conn, monkeypatch):
+    """mftool's constructor has no timeout, so an unreachable host would otherwise
+    cost a full OS connect timeout (~75s) per attempt behind a spinner."""
+    monkeypatch.setattr(fetch_amfi_data, "MFTOOL_AVAILABLE", True)
+    monkeypatch.setattr(fetch_amfi_data, "amfi_reachable", lambda *_a, **_k: False)
+
+    def explode(*_a, **_k):
+        raise AssertionError("Mftool must not be constructed when AMFI is unreachable")
+
+    monkeypatch.setattr(fetch_amfi_data, "Mftool", explode)
+    with pytest.raises(fetch_amfi_data.FetchError, match="not reachable"):
+        fetch_amfi_data.fetch_and_store_funds(["111111"], conn=conn, polite_delay=0)
+
+
+def test_unreachable_amfi_still_honours_allow_synthetic(conn, monkeypatch):
+    monkeypatch.setattr(fetch_amfi_data, "MFTOOL_AVAILABLE", True)
+    monkeypatch.setattr(fetch_amfi_data, "amfi_reachable", lambda *_a, **_k: False)
+    monkeypatch.setattr(fetch_amfi_data, "Mftool", lambda *_a, **_k: None)
+    result = fetch_amfi_data.fetch_and_store_funds(
+        ["119598"], conn=conn, allow_synthetic=True, polite_delay=0
+    )
+    assert result.used_synthetic
+
+
+def test_reachability_probe_is_bounded(monkeypatch):
+    """The probe must pass its timeout to the socket, not rely on OS defaults."""
+    captured = {}
+
+    def fake_create_connection(address, timeout=None):
+        captured["address"], captured["timeout"] = address, timeout
+        raise OSError("refused")
+
+    monkeypatch.setattr(fetch_amfi_data.socket, "create_connection", fake_create_connection)
+    assert fetch_amfi_data.amfi_reachable(timeout=3.0) is False
+    assert captured["timeout"] == 3.0
+    assert captured["address"][1] == 443
+
+
+def test_reachability_probe_reports_success(monkeypatch):
+    class FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+    monkeypatch.setattr(fetch_amfi_data.socket, "create_connection", lambda *_a, **_k: FakeSocket())
+    assert fetch_amfi_data.amfi_reachable() is True
 
 
 # --- ingestion orchestration ----------------------------------------------

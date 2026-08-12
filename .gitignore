@@ -1,0 +1,30 @@
+# Data directories
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+data/*.db
+data/*.db-journal
+data/*.db-wal
+
+# Python caches and venv
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+.ipynb_checkpoints/
+.DS_Store
+
+# Generated reports and CI build output
+data/reports/
+build/
+data/latest_fund_performance.csv
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/

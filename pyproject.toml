@@ -1,0 +1,53 @@
+[project]
+name = "indian-mf-tracker"
+version = "2.0.0"
+description = "AMFI mutual fund NAV pipeline with performance, risk, and benchmark-relative analytics"
+# The project targets a single interpreter: 3.13 (pandas 3.x needs 3.11+).
+requires-python = ">=3.13"
+dependencies = [
+    "pandas>=3.0.5",
+    "numpy>=2.5.2",
+    "mftool>=3.3",
+    "requests>=2.34.2",
+]
+
+[project.optional-dependencies]
+# Keep these floors in step with requirements.txt / requirements-dev.txt.
+dashboard = ["streamlit>=1.61.1", "plotly>=6.9.0"]
+dev = ["pytest>=9.1.1", "pytest-cov>=7.1.0", "ruff>=0.16.2", "pre-commit>=4.4.0"]
+notebook = ["jupyter>=1.1.1", "matplotlib>=3.11.1"]
+
+[tool.pytest.ini_options]
+# `pythonpath` lets `from src import ...` resolve without an editable install.
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+filterwarnings = ["error::DeprecationWarning:src.*"]
+
+[tool.coverage.run]
+source = ["src", "main_pipeline"]
+omit = ["*/__pycache__/*", "tests/*"]
+
+[tool.coverage.report]
+exclude_lines = ["pragma: no cover", "if __name__ == .__main__.:", "raise NotImplementedError"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RET", "ARG", "PTH", "RUF"]
+ignore = [
+    "E501",    # line length is enforced by the formatter, not the linter
+    "B008",    # argparse/dataclass defaults are intentional
+    "RUF001",  # the reports legitimately use en/em dashes and the rupee sign
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests reach into private helpers deliberately and use long descriptive names.
+"tests/*" = ["ARG001", "SIM117", "E402", "F401"]
+# The notebook must extend sys.path before importing project modules.
+"notebooks/*.ipynb" = ["E402"]
+
+[tool.ruff.format]
+quote-style = "double"

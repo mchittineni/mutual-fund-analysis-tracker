@@ -64,6 +64,21 @@ MIN_OBSERVATIONS = int(os.getenv("MF_MIN_OBSERVATIONS", "30"))
 FETCH_MAX_RETRIES = int(os.getenv("MF_FETCH_RETRIES", "3"))
 FETCH_BACKOFF_SECONDS = float(os.getenv("MF_FETCH_BACKOFF", "2.0"))
 FETCH_POLITE_DELAY_SECONDS = float(os.getenv("MF_FETCH_DELAY", "1.0"))
+# Bounded reachability probe before the unbounded mftool call. Without it an
+# unreachable AMFI costs a full OS connect timeout (~75s) per attempt, which a
+# dashboard user experiences as a hung spinner.
+FETCH_CONNECT_TIMEOUT = float(os.getenv("MF_CONNECT_TIMEOUT", "5.0"))
+AMFI_HOST = os.getenv("MF_AMFI_HOST", "www.amfiindia.com")
+
+# --- Hosted deployment (Streamlit Community Cloud) -------------------------
+
+# Community Cloud containers have an ephemeral filesystem, so the dashboard
+# fetches NAV data on first load when the database is empty. Set to 0 for a
+# deployment that mounts a pre-built database and must never hit the network.
+AUTO_BOOTSTRAP = os.getenv("MF_AUTO_BOOTSTRAP", "1").lower() not in {"0", "false", "no"}
+# How long the hosted dashboard keeps a cached analysis before recomputing.
+CACHE_TTL_SECONDS = int(os.getenv("MF_CACHE_TTL", "900"))
+
 
 # --- Reporting -------------------------------------------------------------
 

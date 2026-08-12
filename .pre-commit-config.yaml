@@ -1,0 +1,101 @@
+# Local mirror of what CI enforces, so a red build is a surprise rather than a routine.
+#
+#   pip install -r requirements-dev.txt
+#   pre-commit install                        # lint + format on commit
+#   pre-commit install --hook-type pre-push   # run the test suite before pushing
+#   pre-commit run --all-files                # everything, on demand
+#
+# Hook versions are pinned and kept current by Dependabot (.github/dependabot.yml).
+
+# Hook environments use whatever python3 is on PATH. This is deliberately NOT pinned
+# to 3.13: it is the interpreter that runs the linters, not the one that runs the
+# project. The runtime target lives in pyproject.toml (`requires-python`) and in the
+# workflows (`PYTHON_VERSION`), where it is actually enforced.
+default_language_version:
+  python: python3
+
+default_install_hook_types: [pre-commit, pre-push]
+
+repos:
+  # --- correctness of the files themselves ---------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-added-large-files
+        # The SQLite database is a rebuildable cache and must never be committed.
+        args: [--maxkb=512]
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: check-symlinks
+      - id: destroyed-symlinks
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: check-ast
+      - id: debug-statements
+      - id: detect-private-key
+      - id: check-executables-have-shebangs
+      - id: name-tests-test
+        args: [--pytest-test-first]
+
+  # --- lint and format ----------------------------------------------------
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.2
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  # --- notebooks: never commit outputs -----------------------------------
+  # Notebook outputs bloat diffs and can leak local paths and real NAV figures
+  # into the repository. The notebook is a recipe, not a result.
+  - repo: https://github.com/kynan/nbstripout
+    rev: 0.9.1
+    hooks:
+      - id: nbstripout
+
+  # --- GitHub Actions -----------------------------------------------------
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.12
+    hooks:
+      - id: actionlint
+
+  # --- secret scanning ----------------------------------------------------
+  # This project needs no credentials, which makes any match here worth a look.
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+
+  # --- project-specific gates --------------------------------------------
+  - repo: local
+    hooks:
+      - id: no-committed-database
+        name: refuse to commit a NAV database
+        entry: >-
+          bash -c 'echo "Refusing to commit a SQLite database. data/*.db is a rebuildable cache;
+          run the pipeline instead." && exit 1' --
+        language: system
+        files: '\.db$|\.db-wal$|\.db-shm$|\.db-journal$'
+
+      - id: no-generated-reports
+        name: refuse to commit generated reports
+        entry: >-
+          bash -c 'echo "Refusing to commit generated reports. data/reports/ is produced by the
+          pipeline and published by CI." && exit 1' --
+        language: system
+        files: '^data/reports/|^data/latest_fund_performance\.csv$'
+
+      - id: pytest
+        name: pytest (pre-push)
+        entry: pytest -q
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+        # Deliberately pre-push rather than pre-commit: the suite takes ~20s, which is
+        # too slow to pay on every commit but cheap insurance before sharing work.

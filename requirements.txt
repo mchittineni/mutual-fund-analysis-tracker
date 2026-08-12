@@ -1,0 +1,13 @@
+# Runtime dependencies for the pipeline (see requirements-dev.txt for tooling).
+pandas>=3.0.5
+numpy>=2.5.2
+mftool>=3.3
+requests>=2.34.2
+
+# Dashboard (optional -- the pipeline and reports work without these)
+streamlit>=1.61.1
+plotly>=6.9.0
+
+# Notebook (optional)
+jupyter>=1.1.1
+matplotlib>=3.11.1

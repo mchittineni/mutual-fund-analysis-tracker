@@ -5,7 +5,8 @@ Orchestration CLI for the Indian Mutual Fund tracker.
     python main_pipeline.py                        # fetch, analyse, report
     python main_pipeline.py --skip-fetch           # re-analyse what is already stored
     python main_pipeline.py --schemes 119598 120503 --benchmark 120716
-    python main_pipeline.py --allow-synthetic      # offline development only
+    python main_pipeline.py --allow-synthetic      # offline development (fallback only)
+    python main_pipeline.py --synthetic-only       # never touch AMFI (tests, CI)
     python main_pipeline.py --fail-on-critical     # CI gate: exit non-zero on bad data
 
 Exit codes are meaningful so CI can react to *why* a run failed:
@@ -72,8 +73,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--allow-synthetic",
         action="store_true",
-        help="Permit generated NAV data when the live fetch fails (development only; "
-        "every synthetic row is labelled as such in the database and the report)",
+        help="Permit generated NAV data when the live fetch FAILS (development only). "
+        "AMFI is still tried first, so a machine with network access produces real "
+        "data; every synthetic row is labelled in the database and the report",
+    )
+    parser.add_argument(
+        "--synthetic-only",
+        action="store_true",
+        help="Force generated NAV data and never contact AMFI. Use for hermetic tests "
+        "and CI, where --allow-synthetic alone would silently produce real data",
     )
     parser.add_argument(
         "--fail-on-critical",
@@ -113,13 +121,17 @@ def run_pipeline(args: argparse.Namespace) -> int:
         conn = db_manager.setup_database(args.db_path)
         try:
             result = fetch_amfi_data.fetch_and_store_funds(
-                to_fetch, conn=conn, allow_synthetic=args.allow_synthetic
+                to_fetch,
+                conn=conn,
+                # --synthetic-only implies permission; asking for both would be noise.
+                allow_synthetic=args.allow_synthetic or args.synthetic_only,
+                synthetic_only=args.synthetic_only,
             )
             logger.info("Ingestion: %s", result.summary())
         except fetch_amfi_data.FetchError as exc:
             logger.error("Ingestion failed: %s", exc)
             logger.error(
-                "Re-run with --skip-fetch to analyse stored data, or --allow-synthetic to "
+                "Re-run with --skip-fetch to analyse stored data, or --synthetic-only to "
                 "generate clearly-labelled test data."
             )
             return EXIT_FETCH_FAILED

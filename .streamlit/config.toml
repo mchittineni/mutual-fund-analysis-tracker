@@ -1,0 +1,29 @@
+# Streamlit configuration, applied locally and on Community Cloud.
+# Secrets never belong here -- this file is committed. The app needs none:
+# AMFI's NAV endpoint is unauthenticated.
+
+[theme]
+# Neutral palette that stays legible in both light and dark browser settings.
+primaryColor = "#2563eb"
+base = "light"
+
+[server]
+# The app writes only to data/, which is ephemeral on Community Cloud.
+headless = true
+# NAV history for a handful of schemes is small; no need for large uploads.
+maxUploadSize = 5
+
+[browser]
+# Usage stats are off by default here; flip if you want Streamlit's telemetry.
+gatherUsageStats = false
+
+[client]
+# Show errors in the UI rather than only in the container log. The app handles
+# expected failures (AMFI unavailable, empty database) explicitly, so anything
+# reaching this setting is a genuine bug worth seeing.
+showErrorDetails = true
+
+[runner]
+# Re-run the script top-to-bottom on widget interaction, which is the model the
+# dashboard is written for. Caching keeps the analysis from recomputing.
+fastReruns = true

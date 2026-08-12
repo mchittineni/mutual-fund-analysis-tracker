@@ -149,6 +149,43 @@ def test_synthetic_fallback_is_opt_in_and_labelled(conn, monkeypatch):
     assert sources == {"synthetic"}
 
 
+def test_allow_synthetic_still_prefers_real_data(conn, fake_mftool):
+    """`--allow-synthetic` permits a *fallback*; it must not switch off the live fetch.
+
+    Regression test for a CI smoke test that asserted a synthetic label after passing
+    --allow-synthetic on a runner that could reach AMFI, and so was really asserting
+    "the network is down".
+    """
+    fake_mftool(FakeMftool())
+    result = fetch_amfi_data.fetch_and_store_funds(
+        ["111111"], conn=conn, allow_synthetic=True, polite_delay=0
+    )
+    assert not result.used_synthetic
+    assert result.data_source == "amfi"
+
+
+def test_synthetic_only_never_contacts_amfi(conn, monkeypatch):
+    """`synthetic_only` must bypass the network even when mftool works perfectly."""
+
+    class ExplodingMftool:
+        def get_scheme_details(self, _code):
+            raise AssertionError("synthetic_only must not contact AMFI")
+
+        def get_scheme_historical_nav(self, _code):
+            raise AssertionError("synthetic_only must not contact AMFI")
+
+    monkeypatch.setattr(fetch_amfi_data, "MFTOOL_AVAILABLE", True)
+    monkeypatch.setattr(fetch_amfi_data, "Mftool", lambda *_a, **_k: ExplodingMftool())
+
+    result = fetch_amfi_data.fetch_and_store_funds(
+        ["119598"], conn=conn, synthetic_only=True, polite_delay=0
+    )
+    assert result.used_synthetic
+    assert result.data_source == "synthetic"
+    sources = {row[0] for row in conn.execute("SELECT DISTINCT data_source FROM nav_history")}
+    assert sources == {"synthetic"}
+
+
 def test_per_scheme_synthetic_fallback_marks_only_that_scheme(conn, fake_mftool, monkeypatch):
     monkeypatch.setattr(fetch_amfi_data.config, "FETCH_MAX_RETRIES", 1)
     fake_mftool(FakeMftool(fail_codes={"119598"}))
@@ -208,6 +245,42 @@ def test_pipeline_end_to_end_writes_reports(tmp_path, fake_mftool, monkeypatch):
     assert (tmp_path / "reports" / "index.html").exists()
     assert (tmp_path / "reports" / "report.md").exists()
     assert (tmp_path / "reports" / "report.json").exists()
+
+
+def test_cli_synthetic_only_produces_a_labelled_report(tmp_path, monkeypatch):
+    """The exact contract the CI smoke test relies on: forced synthetic data, labelled
+    in all three report formats."""
+    import json
+
+    class ExplodingMftool:
+        def get_scheme_details(self, _code):
+            raise AssertionError("--synthetic-only must not contact AMFI")
+
+        def get_scheme_historical_nav(self, _code):
+            raise AssertionError("--synthetic-only must not contact AMFI")
+
+    monkeypatch.setattr(fetch_amfi_data, "MFTOOL_AVAILABLE", True)
+    monkeypatch.setattr(fetch_amfi_data, "Mftool", lambda *_a, **_k: ExplodingMftool())
+    monkeypatch.setattr(main_pipeline.config, "PERFORMANCE_REPORT_FILE", tmp_path / "legacy.csv")
+
+    reports = tmp_path / "reports"
+    exit_code = main_pipeline.main(
+        [
+            "--synthetic-only",
+            "--schemes",
+            "119598",
+            "--benchmark",
+            "none",
+            "--db-path",
+            str(tmp_path / "s.db"),
+            "--output-dir",
+            str(reports),
+        ]
+    )
+    assert exit_code == main_pipeline.EXIT_OK
+    assert "SYNTHETIC" in (reports / "report.md").read_text()
+    assert "synthetic" in (reports / "index.html").read_text()
+    assert json.loads((reports / "report.json").read_text())["contains_synthetic_data"] is True
 
 
 def test_pipeline_returns_fetch_exit_code_when_ingestion_fails(tmp_path, monkeypatch):

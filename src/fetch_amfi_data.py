@@ -233,6 +233,7 @@ def fetch_and_store_funds(
     conn: sqlite3.Connection | None = None,
     *,
     allow_synthetic: bool = False,
+    synthetic_only: bool = False,
     polite_delay: float = config.FETCH_POLITE_DELAY_SECONDS,
 ) -> FetchResult:
     """Fetch every requested scheme into SQLite and return an audited result.
@@ -240,6 +241,14 @@ def fetch_and_store_funds(
     Per-scheme failures are collected rather than fatal: two good schemes still
     produce a report, with the third listed as failed. The run only raises
     ``FetchError`` when *nothing* could be fetched and synthetic data is off.
+
+    The two synthetic switches mean different things, and conflating them is easy:
+
+    * ``allow_synthetic`` **permits a fallback**. AMFI is still tried first, and
+      synthetic data appears only for schemes that fail.
+    * ``synthetic_only`` **forces** synthetic data and never touches the network.
+      This is what a hermetic test or CI job wants -- with ``allow_synthetic``
+      alone, a run on a machine that can reach AMFI quietly produces real data.
     """
     schemes = [str(code) for code in (target_schemes or config.DEFAULT_TARGET_SCHEMES)]
     result = FetchResult(requested=schemes)
@@ -250,7 +259,12 @@ def fetch_and_store_funds(
 
     run_id = db_manager.start_run(conn, schemes)
     try:
-        if not MFTOOL_AVAILABLE:
+        if synthetic_only:
+            logger.warning("Synthetic-only run requested: AMFI will not be contacted")
+            result.rows_written = generate_synthetic_history(conn, schemes)
+            result.synthetic = list(schemes)
+            result.succeeded = list(schemes)
+        elif not MFTOOL_AVAILABLE:
             message = "mftool is not installed (pip install -r requirements.txt)"
             if not allow_synthetic:
                 raise FetchError(f"{message}; refusing to fabricate NAV data")

@@ -211,13 +211,18 @@ def test_dashboard_survives_widget_reruns(tmp_path, monkeypatch):
     app = AppTest.from_file(str(entry), default_timeout=120)
     app.run()
     assert not app.exception
-    assert len(app.tabs) == 5, "the app did not render on first load"
+    # Assert the labels, not a count: a count is a tripwire that fires whenever a
+    # tab is added, and says nothing about whether the page actually rendered.
+    tabs = {tab.label for tab in app.tabs}
+    assert {"Overview", "Risk", "Screener", "Scheme detail"} <= tabs, (
+        "the app did not render on first load"
+    )
     assert app.metric, "no metrics rendered"
 
     # The regression: a second run must still render a full page.
     app.sidebar.number_input[0].set_value(9.0).run()
     assert not app.exception
-    assert len(app.tabs) == 5, "the app went blank after a widget interaction"
+    assert {tab.label for tab in app.tabs} == tabs, "the app went blank after a widget interaction"
     assert app.metric
 
 

@@ -279,9 +279,28 @@ def upsert_catalogue(conn: sqlite3.Connection, entries: Sequence[object]) -> int
     return conn.total_changes - before
 
 
+_EMPTY_CATALOGUE_STATS = {
+    "schemes": 0,
+    "categories": 0,
+    "fund_houses": 0,
+    "analysable": 0,
+    "nav_rows": 0,
+}
+
+
 def catalogue_stats(db_path: str | Path | None = None) -> dict[str, int]:
-    """Headline counts for the catalogue, for reports and the dashboard."""
+    """Headline counts for the catalogue, for reports and the dashboard.
+
+    A database that does not exist yet -- the first scheduled run, before any
+    cache has been saved -- reports zeros rather than raising. This is a progress
+    probe, and a probe must never be the thing that fails the job it measures.
+    """
     with connection(db_path) as conn:
+        tables = {
+            row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        if not {"scheme_info", "nav_history"} <= tables:
+            return dict(_EMPTY_CATALOGUE_STATS)
         row = conn.execute(
             """
             SELECT COUNT(*) AS schemes,
@@ -299,11 +318,13 @@ def catalogue_stats(db_path: str | Path | None = None) -> dict[str, int]:
             """,
             (config.MIN_OBSERVATIONS,),
         ).fetchone()[0]
+        nav_rows = conn.execute("SELECT COUNT(*) FROM nav_history").fetchone()[0]
     return {
         "schemes": int(row["schemes"]),
         "categories": int(row["categories"]),
         "fund_houses": int(row["fund_houses"]),
         "analysable": int(analysable),
+        "nav_rows": int(nav_rows),
     }
 
 

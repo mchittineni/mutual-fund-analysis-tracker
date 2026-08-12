@@ -466,3 +466,144 @@ def test_category_summary_picks_the_best_end_of_each_metric():
 
 def test_category_summary_of_an_empty_frame_is_empty():
     assert peers.category_summary(pd.DataFrame()) == {}
+
+
+# ---------------------------------------------------------------------------
+# Pipeline universe selection
+# ---------------------------------------------------------------------------
+
+
+def _pipeline_args(**overrides):
+    import main_pipeline
+
+    defaults = {
+        "schemes": None,
+        "all_analysable": False,
+        "category": None,
+        "fund_house": None,
+        "max_schemes": 100,
+        "db_path": None,
+        "skip_fetch": False,
+    }
+    defaults.update(overrides)
+    return main_pipeline.argparse.Namespace(**defaults)
+
+
+def _seed_analysable(conn, codes, category="Equity Scheme - Large Cap Fund"):
+    """Give each code enough NAV history to clear MIN_OBSERVATIONS."""
+    dates = pd.bdate_range(end="2026-08-12", periods=config.MIN_OBSERVATIONS + 5)
+    for code in codes:
+        db_manager.upsert_scheme_info(
+            conn, code, f"Fund {code}", "AMC A", "Open Ended Schemes", category, "amfi"
+        )
+        db_manager.upsert_nav_records(
+            conn,
+            [(code, d.strftime("%Y-%m-%d"), 100.0 + i) for i, d in enumerate(dates)],
+            "amfi",
+        )
+
+
+def test_all_analysable_uses_the_database_and_skips_fetching(conn, db_path):
+    """The catalogue fills the database; --all-analysable is what analyses it.
+
+    Fetching is skipped because full history is one request per scheme -- with a
+    few hundred schemes that would take longer than the analysis, for data
+    already stored.
+    """
+    import main_pipeline
+
+    _seed_analysable(conn, [f"20000{i}" for i in range(6)])
+    conn.close()
+
+    codes, skip_fetch = main_pipeline.resolve_universe(
+        _pipeline_args(all_analysable=True, db_path=db_path)
+    )
+    assert len(codes) == 6
+    assert skip_fetch is True
+
+
+def test_explicit_schemes_still_win(conn, db_path):
+    import main_pipeline
+
+    _seed_analysable(conn, ["200001", "200002"])
+    conn.close()
+    codes, _ = main_pipeline.resolve_universe(
+        _pipeline_args(schemes=["999999"], all_analysable=True, db_path=db_path)
+    )
+    assert codes == ["999999"]
+
+
+def test_category_filter_narrows_the_universe(conn, db_path):
+    import main_pipeline
+
+    _seed_analysable(conn, ["300001", "300002"], category="Debt Scheme - Liquid Fund")
+    _seed_analysable(conn, ["300003"], category="Equity Scheme - Large Cap Fund")
+    conn.close()
+
+    codes, _ = main_pipeline.resolve_universe(
+        _pipeline_args(category="Debt Scheme - Liquid Fund", db_path=db_path)
+    )
+    assert set(codes) == {"300001", "300002"}
+
+
+def test_max_schemes_caps_the_universe(conn, db_path):
+    import main_pipeline
+
+    _seed_analysable(conn, [f"40000{i}" for i in range(8)])
+    conn.close()
+    codes, _ = main_pipeline.resolve_universe(
+        _pipeline_args(all_analysable=True, max_schemes=3, db_path=db_path)
+    )
+    assert len(codes) == 3
+
+
+def test_a_filter_matching_nothing_stops_rather_than_analysing_something_else(conn, db_path):
+    """Answering a different question than the one asked is worse than failing."""
+    import main_pipeline
+
+    _seed_analysable(conn, ["500001"])
+    conn.close()
+    codes, _ = main_pipeline.resolve_universe(
+        _pipeline_args(category="Nonexistent Category", db_path=db_path)
+    )
+    assert codes == []
+
+
+def test_all_analysable_falls_back_loudly_on_an_empty_database(conn, db_path, caplog):
+    """A cache eviction must not stop the scheduled report publishing -- but the
+    smaller universe has to be visible in the log, not silent."""
+    import main_pipeline
+
+    conn.close()
+    with caplog.at_level("WARNING"):
+        codes, _ = main_pipeline.resolve_universe(
+            _pipeline_args(all_analysable=True, db_path=db_path)
+        )
+    assert codes == [str(c) for c in config.DEFAULT_TARGET_SCHEMES]
+    assert "falling back" in caplog.text.lower()
+
+
+def test_backfill_queue_prefers_open_ended_schemes(conn):
+    """~4,700 of AMFI's entries are close-ended, mostly matured FMPs. Filling
+    those first would waste weeks of runs on funds nobody can buy."""
+    for code, scheme_type in (
+        ("600001", "Close Ended Schemes"),
+        ("600002", "Open Ended Schemes"),
+        ("600003", "Close Ended Schemes"),
+        ("600004", "Open Ended Schemes"),
+        ("600005", "Interval Fund Schemes"),
+    ):
+        db_manager.upsert_scheme_info(
+            conn, code, f"Fund {code}", "AMC A", scheme_type, "Income", "amfi"
+        )
+
+    queue = catalogue.schemes_needing_history(conn, limit=10)
+    types = [
+        conn.execute(
+            "SELECT scheme_type FROM scheme_info WHERE scheme_code = ?", (code,)
+        ).fetchone()[0]
+        for code in queue
+    ]
+    assert types[:2] == ["Open Ended Schemes", "Open Ended Schemes"]
+    assert types[2] == "Interval Fund Schemes"
+    assert types[3:] == ["Close Ended Schemes", "Close Ended Schemes"]

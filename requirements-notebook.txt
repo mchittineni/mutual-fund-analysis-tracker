@@ -1,0 +1,5 @@
+# Dependencies for notebooks/exploratory_analysis.ipynb only.
+# Install with: pip install -r requirements-notebook.txt
+-r requirements.txt
+jupyter>=1.1.1
+matplotlib>=3.11.1

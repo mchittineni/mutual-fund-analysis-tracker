@@ -17,7 +17,7 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
-from src import analyzer, bootstrap, config, db_manager, metrics
+from src import analyzer, bootstrap, config, db_manager, metrics, peers, screener
 
 try:
     import plotly.express as px
@@ -60,6 +60,31 @@ def run_analysis(codes: tuple[str, ...], benchmark: str | None, risk_free: float
 @st.cache_data(ttl=config.CACHE_TTL_SECONDS)
 def load_runs() -> pd.DataFrame:
     return db_manager.recent_runs(limit=5)
+
+
+@st.cache_data(ttl=config.CACHE_TTL_SECONDS)
+def catalogue_coverage() -> dict[str, int]:
+    """How much of the AMFI universe is catalogued, and how much is analysable."""
+    return db_manager.catalogue_stats()
+
+
+@st.cache_data(ttl=config.CACHE_TTL_SECONDS, show_spinner="Scoring the category…")
+def score_category(category: str, risk_free: float) -> pd.DataFrame:
+    """Percentile-scored metrics for one AMFI category.
+
+    Cached per category because it recomputes every metric for every fund in it,
+    which is far too slow to redo on each widget interaction.
+    """
+    return screener.score_category(category=category, risk_free_rate=risk_free)
+
+
+@st.cache_data(ttl=config.CACHE_TTL_SECONDS)
+def analysable_categories() -> list[str]:
+    """Categories with at least one fund holding enough history to analyse."""
+    universe = db_manager.search_schemes(with_history_only=True, limit=10_000)
+    if universe.empty:
+        return []
+    return sorted(str(name) for name in universe["scheme_category"].dropna().unique())
 
 
 # `cache_resource` rather than `cache_data`: this is a side effect that must run
@@ -201,8 +226,8 @@ st.caption(
 # Tabs
 # ---------------------------------------------------------------------------
 
-overview_tab, risk_tab, chart_tab, quality_tab, detail_tab = st.tabs(
-    ["Overview", "Risk", "Charts", "Data quality", "Scheme detail"]
+overview_tab, risk_tab, chart_tab, screen_tab, quality_tab, detail_tab = st.tabs(
+    ["Overview", "Risk", "Charts", "Screener", "Data quality", "Scheme detail"]
 )
 
 
@@ -407,6 +432,107 @@ with chart_tab:
             "long did it stay there?"
         )
 
+with screen_tab:
+    st.subheader("Screen the universe")
+    coverage = catalogue_coverage()
+    categories = analysable_categories()
+
+    st.caption(
+        f"{coverage['schemes']:,} scheme(s) catalogued across {coverage['categories']} "
+        f"categories; {coverage['analysable']:,} have enough NAV history to analyse. "
+        "The scheduled catalogue job backfills more history every day."
+    )
+
+    if not categories:
+        st.info(
+            "No category has enough history to screen yet. Run "
+            "`python -m src.catalogue --backfill 100` to fetch the full scheme "
+            "universe and start filling in history."
+        )
+    else:
+        chosen = st.selectbox("Category", categories, key="screen_category")
+        scored = score_category(chosen, risk_free)
+
+        if scored.empty:
+            st.info(f"No analysable fund in {chosen} yet.")
+        elif len(scored) < peers.MIN_PEERS:
+            # Deliberately no score: a percentile against four funds is noise
+            # dressed as precision, and the table would look authoritative anyway.
+            st.warning(
+                f"Only {len(scored)} analysable fund(s) in this category. At least "
+                f"{peers.MIN_PEERS} are needed before a percentile means anything, so "
+                "no score is shown.",
+                icon="⚠️",
+            )
+            st.dataframe(styled(scored), width="stretch", hide_index=True)
+        else:
+            controls = st.columns(3)
+            min_cagr = controls[0].number_input(
+                "Minimum 3Y CAGR %", value=0.0, step=1.0, key="screen_min_cagr"
+            )
+            max_vol = controls[1].number_input(
+                "Maximum volatility %", value=100.0, step=1.0, key="screen_max_vol"
+            )
+            house = controls[2].text_input("Fund house contains", key="screen_house")
+
+            view = scored.copy()
+            view = view[
+                pd.to_numeric(view["cagr_3y_pct"], errors="coerce").fillna(-1e9) >= min_cagr
+            ]
+            view = view[
+                pd.to_numeric(view["volatility_pct"], errors="coerce").fillna(1e9) <= max_vol
+            ]
+            if house:
+                view = view[
+                    view["fund_house"].astype(str).str.contains(house, case=False, na=False)
+                ]
+
+            st.caption(
+                f"{len(view)} of {len(scored)} fund(s) match. Scores are **category "
+                "percentiles** (0–100), weighted "
+                + ", ".join(f"{n} {w:.0%}" for n, w in screener.DEFAULT_WEIGHTS.items())
+                + ". A score ranks a fund against its own category, never across "
+                "categories — and it is not advice."
+            )
+
+            columns = [
+                "scheme_name",
+                "fund_house",
+                "score",
+                "score_returns",
+                "score_risk_adjusted",
+                "score_drawdown",
+                "score_consistency",
+                "cagr_3y_pct",
+                "volatility_pct",
+                "sharpe_ratio",
+                "max_drawdown_pct",
+            ]
+            st.dataframe(
+                styled(view[[c for c in columns if c in view.columns]]),
+                width="stretch",
+                hide_index=True,
+            )
+
+            if not view.empty:
+                st.subheader("Why a fund scores what it does")
+                pick = st.selectbox("Fund", list(view["scheme_name"]), key="screen_explain_scheme")
+                code = view.loc[view["scheme_name"] == pick, "scheme_code"].iloc[0]
+                breakdown = screener.explain_score(scored, str(code))
+                if breakdown is not None:
+                    # The components travel with the score, always: 68 from strong
+                    # returns and a deep drawdown is a different fund from 68 across
+                    # the board, and a single number cannot tell them apart.
+                    st.markdown(breakdown.explain())
+
+            st.download_button(
+                "Download this screen (CSV)",
+                view.to_csv(index=False).encode(),
+                file_name=f"screen_{chosen.replace(' ', '_')}.csv",
+                mime="text/csv",
+            )
+
+
 with quality_tab:
     summary = result.quality.summary()
     columns = st.columns(5)
@@ -518,6 +644,50 @@ with detail_tab:
         if scheme.notes:
             for note in scheme.notes:
                 st.warning(note)
+
+        # "Where does it sit among its peers?" is usually the more useful question
+        # than "did it beat the index?", and it needs the category catalogue.
+        if scheme.scheme_category:
+            st.subheader(f"Against its category: {scheme.scheme_category}")
+            category_frame = score_category(scheme.scheme_category, risk_free)
+            comparison = (
+                peers.compare_within_category(
+                    category_frame, scheme.scheme_code, scheme.scheme_category
+                )
+                if not category_frame.empty
+                else None
+            )
+            if comparison is None:
+                st.caption(
+                    f"Fewer than {peers.MIN_PEERS} funds in this category have enough "
+                    "stored history to rank against, so no percentile is shown. The "
+                    "scheduled catalogue job fills in more history each day."
+                )
+            else:
+                ranks = pd.DataFrame(
+                    [
+                        {
+                            "Metric": rank.metric,
+                            "This fund": round(rank.value, 2),
+                            "Category median": round(rank.category_median, 2),
+                            "Percentile": round(rank.percentile),
+                            "Quartile": f"Q{rank.quartile}",
+                        }
+                        for rank in comparison.ranks.values()
+                    ]
+                )
+                st.dataframe(ranks, width="stretch", hide_index=True)
+                st.caption(
+                    f"Ranked against {comparison.peers} peer(s). Percentiles are "
+                    "direction-corrected, so 100 is always good — including for "
+                    "volatility and drawdown, where a lower raw value is better."
+                )
+                strengths = comparison.top_quartile_metrics()
+                weaknesses = comparison.bottom_quartile_metrics()
+                if strengths:
+                    st.success("Top quartile: " + ", ".join(strengths), icon="✅")
+                if weaknesses:
+                    st.warning("Bottom quartile: " + ", ".join(weaknesses), icon="⚠️")
 
         st.subheader("NAV with moving averages")
         nav = result.nav_series[scheme.scheme_code]

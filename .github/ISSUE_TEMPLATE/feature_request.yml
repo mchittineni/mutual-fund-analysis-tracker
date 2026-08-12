@@ -1,0 +1,97 @@
+name: Feature request
+description: Propose a new metric, check, or capability
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For anything large, consider opening a discussion first so we can agree on the shape before
+        you invest time in an implementation.
+
+        Please note what this project will **not** do: give investment advice, recommend funds,
+        predict prices, or produce a number it cannot justify from the data.
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What kind of addition
+      options:
+        - A new metric (return, risk, risk-adjusted, benchmark-relative)
+        - A new data-quality check
+        - Reporting or visualisation
+        - Dashboard capability
+        - Ingestion or data source
+        - CLI or configuration
+        - CI / automation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What decision would this support
+      description: >
+        What question can you not answer today? Describe the gap, not the implementation — the
+        strongest requests start from a decision the current output cannot inform.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behaviour
+      description: What should the project do?
+    validations:
+      required: true
+
+  - type: textarea
+    id: definition
+    attributes:
+      label: Precise definition (for a new metric or check)
+      description: >
+        Financial additions need a definition specific enough to test. Please give the formula, the
+        annualisation convention, the minimum history below which it must return `None`, and a
+        reference (textbook, SEBI/AMFI guidance, or a recognised methodology) if one exists.
+      value: |
+        Formula:
+        Annualisation convention:
+        Minimum observations before it is meaningful:
+        Behaviour when data is insufficient:
+        Reference:
+    validations:
+      required: false
+
+  - type: textarea
+    id: known-answer
+    attributes:
+      label: A known-answer test case
+      description: >
+        An input whose correct output can be derived by hand (e.g. "a series compounding at exactly
+        10%/year must report 10%"). Every metric in this project is tested this way rather than
+        against previously observed output.
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Existing metrics or workarounds you tried, and why they fall short.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Scope check
+      options:
+        - label: This does not require the project to give investment advice or recommend a fund
+          required: true
+        - label: This can be computed from data the project already has, or from a clearly named new public source
+          required: true
+        - label: I searched existing issues for a duplicate
+          required: true
+        - label: I would be willing to work on this
+          required: false

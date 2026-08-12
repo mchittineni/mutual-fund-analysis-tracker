@@ -1,0 +1,111 @@
+name: Bug report
+description: Something crashes, errors, or behaves differently from what is documented
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. If the problem is a **wrong number rather than a crash**, please use
+        the *Data quality issue* template instead — it asks the right questions.
+
+        If this is a **security** problem, do not file it here. See
+        [SECURITY.md](https://github.com/mchittineni/mutual-fund-analysis-tracker/blob/main/SECURITY.md).
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you observe, and what did you expect instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The exact command you ran, including flags.
+      placeholder: |
+        1. python main_pipeline.py --schemes 119598 --benchmark none
+        2. ...
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log output or traceback
+      description: >
+        Re-run with `--log-level DEBUG` if you can. Redact anything you consider private —
+        though note this project handles only public NAV data.
+      render: text
+    validations:
+      required: false
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Which part of the pipeline
+      options:
+        - Ingestion (fetch_amfi_data / mftool / network)
+        - Database (db_manager / SQLite / migrations)
+        - Data-quality gate (validation)
+        - Metrics (metrics.py)
+        - Analysis and insights (analyzer.py)
+        - Reporting (report.py — Markdown / HTML / JSON / CSV)
+        - Dashboard (Streamlit)
+        - GitHub Actions workflow
+        - Notebook
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: exit-code
+    attributes:
+      label: Exit code
+      description: "From `echo $?`. 0 success · 1 unexpected error · 2 ingestion failed · 3 critical data quality"
+      placeholder: "1"
+    validations:
+      required: false
+
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version
+      description: "Output of `python --version`. The project targets 3.13."
+      placeholder: "3.13.2"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: "macOS 15.3 / Ubuntu 24.04 / Windows 11"
+    validations:
+      required: true
+
+  - type: textarea
+    id: versions
+    attributes:
+      label: Dependency versions
+      description: "Output of `pip list | grep -Ei 'pandas|numpy|mftool|streamlit|plotly'`"
+      render: text
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I am running the latest `main`
+          required: false
+        - label: I searched existing issues for a duplicate
+          required: true
+        - label: I can reproduce this consistently
+          required: false
+        - label: This is not a security vulnerability (those go through a private advisory)
+          required: true

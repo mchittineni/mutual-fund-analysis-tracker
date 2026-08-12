@@ -1,0 +1,217 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.13"
+
+jobs:
+  quality:
+    name: Quality (pre-commit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install pre-commit
+        run: pip install pre-commit
+
+      - name: Cache hook environments
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ env.PYTHON_VERSION }}-${{ hashFiles('.pre-commit-config.yaml') }}
+          restore-keys: pre-commit-${{ env.PYTHON_VERSION }}-
+
+      - name: Run every hook
+        run: pre-commit run --all-files --show-diff-on-failure --color=always
+
+      - name: Explain a hook failure
+        if: failure()
+        run: |
+          {
+            echo "## Quality gate failed"
+            echo
+            echo "Reproduce and fix locally:"
+            echo
+            echo '```bash'
+            echo "pip install -r requirements-dev.txt"
+            echo "pre-commit install"
+            echo "pre-commit run --all-files"
+            echo '```'
+            echo
+            echo "Most hooks (ruff, formatting, end-of-file, notebook stripping) fix the"
+            echo "files in place -- re-stage and commit the result."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run tests with coverage
+        run: pytest --cov --cov-report=term-missing --cov-report=xml --junit-xml=junit.xml
+
+      - name: Publish results to the run summary
+        if: always()
+        env:
+          PY_VERSION: ${{ env.PYTHON_VERSION }}
+        run: |
+          {
+            echo "### Tests — Python $PY_VERSION"
+            echo
+            python - <<'PY'
+          import pathlib
+          import xml.etree.ElementTree as ET
+
+          junit = pathlib.Path("junit.xml")
+          if junit.exists():
+              suite = ET.parse(junit).getroot().find("testsuite")
+              if suite is not None:
+                  total = int(suite.get("tests", 0))
+                  bad = sum(int(suite.get(k, 0)) for k in ("failures", "errors"))
+                  skipped = int(suite.get("skipped", 0))
+                  print(f"| Tests | Passed | Failed | Skipped |")
+                  print(f"|---|---|---|---|")
+                  print(f"| {total} | {total - bad - skipped} | {bad} | {skipped} |")
+                  print()
+
+          cov = pathlib.Path("coverage.xml")
+          if cov.exists():
+              rate = float(ET.parse(cov).getroot().get("line-rate", 0)) * 100
+              print(f"Line coverage: **{rate:.1f}%**")
+          else:
+              print("_No coverage report produced._")
+          PY
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-xml
+          path: |
+            coverage.xml
+            junit.xml
+          retention-days: 14
+          if-no-files-found: warn
+
+  smoke:
+    name: Pipeline smoke test
+    runs-on: ubuntu-latest
+    needs: test
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run the pipeline against synthetic data
+        run: |
+          python main_pipeline.py \
+            --allow-synthetic \
+            --schemes 119598 125497 120503 \
+            --benchmark 120716 \
+            --output-dir build/reports \
+            --summary-file /dev/null
+
+      - name: Verify every artifact was produced
+        run: |
+          set -euo pipefail
+          for file in report.md index.html report.json fund_metrics.csv; do
+            test -s "build/reports/$file" || { echo "::error::missing build/reports/$file"; exit 1; }
+          done
+
+          # Data-integrity guarantee: synthetic NAVs must never reach a report unlabelled.
+          grep -q "SYNTHETIC" build/reports/report.md \
+            || { echo "::error::synthetic data was not labelled in report.md"; exit 1; }
+          grep -q "synthetic" build/reports/index.html \
+            || { echo "::error::synthetic data was not labelled in index.html"; exit 1; }
+          python -c "
+          import json, sys
+          d = json.load(open('build/reports/report.json'))
+          assert d['contains_synthetic_data'] is True, 'report.json did not flag synthetic data'
+          assert d['schemes'], 'report.json contains no schemes'
+          print(f\"report.json: {len(d['schemes'])} schemes, {len(d['insights'])} insights\")
+          "
+
+          # The published page must stay self-contained: no external requests, no scripts.
+          if grep -qE 'src="https?://|href="https?://|<script' build/reports/index.html; then
+            echo "::error::index.html is no longer self-contained (external asset or script found)"
+            exit 1
+          fi
+          echo "All report artifacts present, self-contained, and correctly labelled."
+
+      - name: Summarise the smoke test
+        if: always()
+        run: |
+          {
+            echo "### Pipeline smoke test"
+            echo
+            echo "| Artifact | Size |"
+            echo "|---|---|"
+            for file in report.md index.html report.json fund_metrics.csv; do
+              if [ -f "build/reports/$file" ]; then
+                echo "| \`$file\` | $(wc -c < "build/reports/$file" | tr -d ' ') bytes |"
+              else
+                echo "| \`$file\` | **missing** |"
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the smoke-test report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: smoke-test-report
+          path: build/reports
+          retention-days: 7
+          if-no-files-found: warn

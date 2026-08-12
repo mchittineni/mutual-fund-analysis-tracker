@@ -145,6 +145,9 @@ Reports land in `data/reports/`: `report.md`, `index.html`, `report.json`, `fund
 
 ```bash
 python main_pipeline.py --schemes 119598 125497 120503 --benchmark 120716
+python main_pipeline.py --all-analysable         # every fund with enough stored history
+python main_pipeline.py --category "Debt Scheme - Liquid Fund"
+python main_pipeline.py --fund-house "SBI Mutual Fund" --max-schemes 50
 python main_pipeline.py --skip-fetch             # re-analyse stored data, no network
 python main_pipeline.py --risk-free-rate 0.072   # move the Sharpe/alpha hurdle
 python main_pipeline.py --fail-on-critical       # CI gate on data quality
@@ -184,10 +187,27 @@ The two costs are what shape the design:
 | Returns | Metadata, ISINs, today's NAV | Full NAV history |
 | Practical cadence | Daily | A slice per run, indefinitely |
 
-So a daily catalogue run does double duty: it keeps the universe current, and it accumulates one NAV
-per scheme per day, growing a real history for every fund over time. `--backfill` fills in the past
-for the funds closest to being analysable first, and `--time-budget` stops it cleanly before a
-runner timeout — successive runs complete the universe without any single run being long.
+So a catalogue run does double duty: it keeps the universe current, and it accumulates one NAV per
+scheme per day, growing a real history for every fund over time. `--backfill` fills in the past, and
+`--time-budget` stops it cleanly before a runner timeout — successive runs complete the universe
+without any single run being long.
+
+**Cataloguing a fund is not the same as being able to analyse it.** A catalogue run gives every
+scheme *one* NAV; a fund needs `MF_MIN_OBSERVATIONS` (30) before any metric is computed. So the two
+numbers to watch are different:
+
+| | After one catalogue run |
+|---|---|
+| Schemes catalogued | 14,268 |
+| Schemes with **one** NAV | 13,887 |
+| Schemes **analysable** | the backfilled ones |
+
+The backfill queue is ordered deliberately. Roughly 4,700 of AMFI's entries are close-ended —
+overwhelmingly matured fixed-maturity plans nobody can buy — so open-ended schemes are filled first.
+That is the difference between useful coverage in a fortnight and archival coverage in six weeks.
+Measured against the live feed, a backfill runs at **~7 seconds per scheme**, so one 45-minute
+budget fills roughly 350 funds and the ~8,300 open-ended schemes take about ten days at four runs
+a day.
 
 ### Screening and scoring
 
@@ -237,7 +257,11 @@ Every setting is env-overridable — no code change needed to retarget an enviro
 ## How the analysis is presented (GitHub Actions)
 
 [`.github/workflows/pipeline.yml`](.github/workflows/pipeline.yml) runs every Monday at 02:30 UTC
-(08:00 IST) and on manual dispatch, then presents the result at the end of the run:
+(08:00 IST) and on manual dispatch. By default it analyses **every fund with enough stored
+history** (`--all-analysable`, capped at 250 by `max_schemes`), so the published report grows as the
+catalogue job fills coverage in, rather than staying pinned to a hand-picked list. Dispatch with
+`universe: configured` for the small list, or set `category` to scope a run. Then it presents the
+result at the end:
 
 1. **Job summary** — the pipeline writes its Markdown report straight to `$GITHUB_STEP_SUMMARY`,
    so the full analysis (executive summary, performance, risk, benchmark, rolling returns, data
@@ -264,8 +288,11 @@ is enabled the publish job is skipped, and the summary plus artifacts still work
 (06:30 IST), an hour and a half before the analysis pipeline, and does two things per run:
 
 1. **Refresh the catalogue** — one request, every scheme, metadata plus the day's NAV.
-2. **Backfill a slice of history** — up to 150 funds by default, stopping at a 40-minute budget so
-   the job ends gracefully with its work saved rather than being killed at the runner timeout.
+2. **Backfill a slice of history** — stopping at a 45-minute budget so the job ends gracefully with
+   its work saved rather than being killed at the runner timeout.
+
+It runs four times a day rather than once, because the backfill is the bottleneck: the catalogue
+only changes when AMFI publishes, but history is one request per scheme.
 
 The job summary shows coverage by category and a before/after table of what the run added, so
 progress toward full coverage is visible on every run rather than inferred. The database is carried

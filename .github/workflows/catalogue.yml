@@ -1,0 +1,188 @@
+name: AMFI Catalogue
+
+on:
+  schedule:
+    # 01:00 UTC daily = 06:30 IST, after AMFI publishes the previous day's NAVs
+    # and before the weekly analysis pipeline runs at 02:30 UTC.
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+    inputs:
+      backfill:
+        description: 'Fetch full history for up to N schemes that lack it (0 = catalogue only)'
+        required: false
+        default: '150'
+      backfill_category:
+        description: 'Restrict the backfill queue to one AMFI category (blank = all)'
+        required: false
+        default: ''
+      backfill_fund_house:
+        description: 'Restrict the backfill queue to one AMC (blank = all)'
+        required: false
+        default: ''
+      time_budget:
+        description: 'Seconds to spend backfilling before stopping'
+        required: false
+        default: '2400'
+      store_navs:
+        description: "Store the day's NAV snapshot alongside the metadata"
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: fund-catalogue
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.13"
+
+jobs:
+  catalogue:
+    name: Refresh catalogue and backfill history
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Restore the NAV database
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: data/mf_database.db
+          key: nav-db-${{ github.run_id }}
+          restore-keys: nav-db-
+
+      - name: Record the starting coverage
+        id: before
+        run: |
+          set -euo pipefail
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          from src import db_manager
+
+          for key, value in db_manager.catalogue_stats().items():
+              print(f"{key}={value}")
+          PY
+
+      - name: Refresh the catalogue and backfill a slice of history
+        id: refresh
+        env:
+          BACKFILL: ${{ inputs.backfill || '150' }}
+          BACKFILL_CATEGORY: ${{ inputs.backfill_category }}
+          BACKFILL_FUND_HOUSE: ${{ inputs.backfill_fund_house }}
+          TIME_BUDGET: ${{ inputs.time_budget || '2400' }}
+          STORE_NAVS: ${{ github.event_name != 'workflow_dispatch' || inputs.store_navs }}
+        run: |
+          set -euo pipefail
+          args=(--log-level INFO --summary-file "$GITHUB_STEP_SUMMARY")
+          if [ "$STORE_NAVS" != "true" ]; then
+            args+=(--no-navs)
+          fi
+          # A dispatch input is free text: reject a non-numeric one with a clear
+          # message rather than letting `-gt` abort the job under `set -e`.
+          if ! [[ "$BACKFILL" =~ ^[0-9]+$ ]]; then
+            echo "backfill must be a whole number, got '$BACKFILL'" >&2
+            exit 1
+          fi
+          if [ "$BACKFILL" -gt 0 ]; then
+            args+=(--backfill "$BACKFILL" --time-budget "$TIME_BUDGET")
+            if [ -n "$BACKFILL_CATEGORY" ]; then
+              args+=(--backfill-category "$BACKFILL_CATEGORY")
+            fi
+            if [ -n "$BACKFILL_FUND_HOUSE" ]; then
+              args+=(--backfill-fund-house "$BACKFILL_FUND_HOUSE")
+            fi
+          fi
+
+          # The command appends its own coverage tables to the job summary.
+          python -m src.catalogue "${args[@]}"
+
+      - name: Report what this run added
+        if: always()
+        env:
+          BEFORE_SCHEMES: ${{ steps.before.outputs.schemes }}
+          BEFORE_ANALYSABLE: ${{ steps.before.outputs.analysable }}
+          BEFORE_NAV_ROWS: ${{ steps.before.outputs.nav_rows }}
+        run: |
+          set -euo pipefail
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import os
+
+          from src import db_manager
+
+          after = db_manager.catalogue_stats()
+
+
+          def before(name: str) -> int:
+              raw = os.environ.get(f"BEFORE_{name.upper()}", "")
+              return int(raw) if raw.strip().lstrip("-").isdigit() else 0
+
+
+          print("### Progress this run\n")
+          print("| Measure | Before | After | Added |")
+          print("|:--|---:|---:|---:|")
+          for label, key in (
+              ("Schemes catalogued", "schemes"),
+              ("Schemes with analysable history", "analysable"),
+              ("NAV rows stored", "nav_rows"),
+          ):
+              start, end = before(key), int(after.get(key, 0))
+              print(f"| {label} | {start:,} | {end:,} | {end - start:+,} |")
+
+          remaining = int(after.get("schemes", 0)) - int(after.get("analysable", 0))
+          print()
+          if remaining > 0:
+              print(
+                  f"{remaining:,} scheme(s) still lack enough history to analyse. "
+                  "Each daily run fills another slice; NAV history for the rest also "
+                  "accumulates one day at a time from the catalogue snapshot itself."
+              )
+          else:
+              print("Every catalogued scheme now has enough history to analyse.")
+          PY
+
+      - name: Save the NAV database
+        if: always()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: data/mf_database.db
+          key: nav-db-${{ github.run_id }}
+
+      - name: Upload the database
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mf-database
+          path: data/mf_database.db
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Explain a failed run
+        if: failure()
+        run: |
+          {
+            echo "## Catalogue refresh failed"
+            echo
+            echo "| Exit code | Meaning | Usual next step |"
+            echo "|---|---|---|"
+            echo "| 2 | AMFI was unreachable, or the feed parsed to zero schemes | Re-run; a zero parse count means the NAVAll.txt format changed and \`parse_navall()\` needs updating |"
+            echo "| 1 | Unexpected error | See the step log |"
+            echo
+            echo "Whatever had been written before the failure was still cached, so the"
+            echo "next run resumes rather than restarting."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,22 @@
+# Keep the blank-issue escape hatch: not every report fits a form.
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/mchittineni/mutual-fund-analysis-tracker/security/advisories/new
+    about: Report privately via a security advisory — never in a public issue. See SECURITY.md.
+
+  - name: Question about a metric or a convention
+    url: https://github.com/mchittineni/mutual-fund-analysis-tracker/blob/main/README.md#methodology-notes
+    about: >
+      Day-count conventions, why sub-1-year returns are not annualised, what the benchmark proxy is,
+      and what the project does not model are all documented in the README.
+
+  - name: Contributing guide
+    url: https://github.com/mchittineni/mutual-fund-analysis-tracker/blob/main/CONTRIBUTING.md
+    about: Setup, the correctness principles, and how to add a metric or a data-quality check.
+
+  - name: Investment advice
+    url: https://www.sebi.gov.in/sebiweb/other/OtherAction.do?doRecognisedFpi=yes&intmId=13
+    about: >
+      This project is research tooling, not advice, and cannot tell you which fund to buy. Consult a
+      SEBI-registered investment adviser.

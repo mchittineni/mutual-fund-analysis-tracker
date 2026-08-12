@@ -1,0 +1,117 @@
+name: Data quality issue
+description: A reported number looks wrong, or the data behind it does
+title: "data: "
+labels: ["data-quality"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this when the pipeline **runs fine but produces a number you believe is wrong** — a
+        suspicious return, a NAV that does not match AMFI, a metric that should have been suppressed
+        for lack of history, or a quality check that fired when it should not have.
+
+        These reports are the most valuable kind this project receives. A wrong number does not
+        throw an exception; it quietly misinforms. Please bring a source.
+
+  - type: input
+    id: scheme
+    attributes:
+      label: AMFI scheme code
+      description: The six-digit code (or codes) affected.
+      placeholder: "119598"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: What kind of problem
+      options:
+        - A metric value looks wrong
+        - Stored NAV does not match AMFI
+        - A metric was reported when history was too short
+        - A metric was suppressed (—) when it should have been available
+        - A data-quality check fired incorrectly (false positive)
+        - A data-quality problem was NOT caught (false negative)
+        - Scheme metadata is wrong or missing
+        - Benchmark-relative figures look implausible
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: metric
+    attributes:
+      label: Which metric
+      placeholder: "cagr_3y_pct / sharpe_ratio / max_drawdown_pct / sip_xirr_3y_pct"
+    validations:
+      required: false
+
+  - type: textarea
+    id: values
+    attributes:
+      label: Reported vs expected
+      description: What the pipeline produced, what you expected, and the `as_of` date.
+      value: |
+        As-of date:
+        Reported value:
+        Expected value:
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Source for the expected value
+      description: >
+        Where does the correct figure come from — the AMFI NAV file, the AMC factsheet, a
+        hand calculation? A hand calculation is fine; please show the inputs and the arithmetic so
+        it can be turned into a test.
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command used
+      description: Include the risk-free rate and benchmark, since both move several metrics.
+      placeholder: "python main_pipeline.py --schemes 119598 --benchmark 120716 --risk-free-rate 0.065"
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: quality-section
+    attributes:
+      label: Data-quality section from the report
+      description: >
+        Paste the *Data quality* table from `report.md`, or the `data_quality` block from
+        `report.json`. It usually explains the discrepancy on its own.
+      render: text
+    validations:
+      required: false
+
+  - type: dropdown
+    id: provenance
+    attributes:
+      label: Data provenance
+      description: "Check `data_source` in the report — synthetic figures are generated and are never real returns."
+      options:
+        - "amfi (real data)"
+        - "synthetic (generated test data)"
+        - "mixed"
+        - "unknown"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I confirmed the report is **not** based on synthetic data
+          required: false
+        - label: I read the report's *Methodology & assumptions* section (conventions differ between sources — e.g. sub-1-year returns are deliberately not annualised)
+          required: true
+        - label: I searched existing issues for a duplicate
+          required: true

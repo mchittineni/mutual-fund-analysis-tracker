@@ -1,0 +1,182 @@
+name: Fund Analysis Pipeline
+
+on:
+  schedule:
+    # 02:30 UTC every Monday = 08:00 IST, comfortably after AMFI publishes.
+    - cron: '30 2 * * 1'
+  workflow_dispatch:
+    inputs:
+      schemes:
+        description: 'Space-separated AMFI scheme codes (blank = configured universe)'
+        required: false
+        default: ''
+      benchmark:
+        description: "Benchmark scheme code, or 'none' to skip relative metrics"
+        required: false
+        default: '120716'
+      risk_free_rate:
+        description: 'Annual risk-free rate as a decimal (e.g. 0.065)'
+        required: false
+        default: '0.065'
+      sip_amount:
+        description: 'Monthly SIP instalment in INR, used for the XIRR calculation'
+        required: false
+        default: '10000'
+      fail_on_critical:
+        description: 'Fail the run (exit 3) on critical data-quality findings'
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: fund-pipeline
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.13"
+
+jobs:
+  analyse:
+    name: Fetch, analyse, report
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      pages_ready: ${{ steps.report.outputs.pages_ready }}
+      schemes_analysed: ${{ steps.report.outputs.schemes_analysed }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Restore the NAV database
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: data/mf_database.db
+          key: nav-db-${{ github.run_id }}
+          restore-keys: nav-db-
+
+      - name: Run the analysis pipeline
+        id: report
+        env:
+          SCHEMES: ${{ inputs.schemes }}
+          BENCHMARK: ${{ inputs.benchmark || '120716' }}
+          RISK_FREE: ${{ inputs.risk_free_rate || '0.065' }}
+          SIP_AMOUNT: ${{ inputs.sip_amount || '10000' }}
+          FAIL_ON_CRITICAL: ${{ github.event_name != 'workflow_dispatch' || inputs.fail_on_critical }}
+        run: |
+          set -euo pipefail
+          args=(--output-dir build/reports --log-level INFO)
+          args+=(--benchmark "$BENCHMARK" --risk-free-rate "$RISK_FREE" --sip-amount "$SIP_AMOUNT")
+          if [ "$FAIL_ON_CRITICAL" = "true" ]; then
+            args+=(--fail-on-critical)
+          fi
+          if [ -n "$SCHEMES" ]; then
+            read -r -a scheme_list <<< "$SCHEMES"
+            args+=(--schemes "${scheme_list[@]}")
+          fi
+
+          # The pipeline appends its Markdown report to $GITHUB_STEP_SUMMARY
+          # automatically, which is what renders the analysis on the run page.
+          python main_pipeline.py "${args[@]}"
+
+          count=$(python -c "
+          import json
+          print(len(json.load(open('build/reports/report.json'))['schemes']))
+          ")
+          echo "schemes_analysed=$count" >> "$GITHUB_OUTPUT"
+          echo "pages_ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: Save the NAV database
+        if: always()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: data/mf_database.db
+          key: nav-db-${{ github.run_id }}
+
+      - name: Upload report artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fund-analysis-report
+          path: |
+            build/reports/report.md
+            build/reports/report.json
+            build/reports/index.html
+            build/reports/fund_metrics.csv
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Prepare the Pages bundle
+        if: success()
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: build/reports
+
+      - name: Explain a failed run in the job summary
+        if: failure()
+        run: |
+          {
+            echo "## Pipeline failed"
+            echo
+            echo "| Exit code | Meaning | Usual next step |"
+            echo "|---|---|---|"
+            echo "| 2 | AMFI ingestion failed (network, rate limit, or mftool error) | Re-run; if it persists, check whether the AMFI feed changed |"
+            echo "| 3 | Critical data-quality findings — the report was withheld deliberately | Read the failing checks in the step log |"
+            echo "| 1 | Unexpected error | See the step log, then open a bug report |"
+            echo
+            echo "No report was published, which is the intended behaviour: a stale or"
+            echo "invalid dataset must not be presented as current analysis."
+            echo
+            echo "To reproduce locally against stored data, without contacting AMFI:"
+            echo
+            echo '```bash'
+            echo "python main_pipeline.py --skip-fetch --log-level DEBUG"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: Publish to GitHub Pages
+    needs: analyse
+    if: needs.analyse.outputs.pages_ready == 'true' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
+
+      - name: Link the published report from the summary
+        env:
+          PAGE_URL: ${{ steps.deployment.outputs.page_url }}
+          SCHEMES_ANALYSED: ${{ needs.analyse.outputs.schemes_analysed }}
+        run: |
+          {
+            echo "## Report published"
+            echo
+            echo "[Open the interactive report]($PAGE_URL) — $SCHEMES_ANALYSED scheme(s) analysed."
+            echo
+            echo "The full analysis is also rendered in the previous job's summary, and the"
+            echo "Markdown, JSON, and CSV versions are attached as artifacts."
+          } >> "$GITHUB_STEP_SUMMARY"

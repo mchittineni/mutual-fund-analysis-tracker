@@ -1,0 +1,29 @@
+version: 2
+updates:
+  # Python dependencies. Grouped so a routine bump is one PR, not five --
+  # except pandas/numpy, which carry real behavioural risk for the metric layer
+  # and deserve their own PR and their own test run.
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: quarterly
+    open-pull-requests-limit: 5
+    labels: [dependencies]
+    groups:
+      dev-tooling:
+        patterns: ["pytest*", "ruff", "pre-commit"]
+      dashboard:
+        patterns: ["streamlit", "plotly"]
+      notebook:
+        patterns: ["jupyter*", "matplotlib", "ipykernel", "nbformat"]
+
+  # Pinned action SHAs go stale silently; this keeps them current.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: semiannually
+    open-pull-requests-limit: 5
+    labels: [dependencies, ci]
+    groups:
+      actions:
+        patterns: ["*"]

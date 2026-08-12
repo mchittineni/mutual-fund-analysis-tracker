@@ -7,9 +7,25 @@ on:
   workflow_dispatch:
     inputs:
       schemes:
-        description: 'Space-separated AMFI scheme codes (blank = configured universe)'
+        description: 'Space-separated AMFI scheme codes (blank = use the universe input)'
         required: false
         default: ''
+      universe:
+        description: 'Which funds to analyse when no explicit scheme codes are given'
+        required: false
+        type: choice
+        options:
+          - analysable
+          - configured
+        default: analysable
+      category:
+        description: 'Restrict to one AMFI category (blank = all)'
+        required: false
+        default: ''
+      max_schemes:
+        description: 'Cap on a database-derived universe, ranked by history depth'
+        required: false
+        default: '250'
       benchmark:
         description: "Benchmark scheme code, or 'none' to skip relative metrics"
         required: false
@@ -74,6 +90,9 @@ jobs:
         id: report
         env:
           SCHEMES: ${{ inputs.schemes }}
+          UNIVERSE: ${{ inputs.universe || 'analysable' }}
+          CATEGORY: ${{ inputs.category }}
+          MAX_SCHEMES: ${{ inputs.max_schemes || '250' }}
           BENCHMARK: ${{ inputs.benchmark || '120716' }}
           RISK_FREE: ${{ inputs.risk_free_rate || '0.065' }}
           SIP_AMOUNT: ${{ inputs.sip_amount || '10000' }}
@@ -88,6 +107,18 @@ jobs:
           if [ -n "$SCHEMES" ]; then
             read -r -a scheme_list <<< "$SCHEMES"
             args+=(--schemes "${scheme_list[@]}")
+          elif [ "$UNIVERSE" = "analysable" ]; then
+            # Everything the catalogue job has filled in with enough history.
+            # This is what makes the published report grow as coverage grows,
+            # instead of staying pinned to the three hand-picked funds.
+            if ! [[ "$MAX_SCHEMES" =~ ^[0-9]+$ ]]; then
+              echo "max_schemes must be a whole number, got '$MAX_SCHEMES'" >&2
+              exit 1
+            fi
+            args+=(--all-analysable --max-schemes "$MAX_SCHEMES")
+            if [ -n "$CATEGORY" ]; then
+              args+=(--category "$CATEGORY")
+            fi
           fi
 
           # The pipeline appends its Markdown report to $GITHUB_STEP_SUMMARY

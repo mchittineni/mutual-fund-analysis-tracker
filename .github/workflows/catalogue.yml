@@ -2,15 +2,13 @@ name: AMFI Catalogue
 
 on:
   schedule:
-    # 01:00 UTC daily = 06:30 IST, after AMFI publishes the previous day's NAVs
-    # and before the weekly analysis pipeline runs at 02:30 UTC.
-    - cron: '0 1 * * *'
+    - cron: '0 1,7,13,19 * * *'
   workflow_dispatch:
     inputs:
       backfill:
         description: 'Fetch full history for up to N schemes that lack it (0 = catalogue only)'
         required: false
-        default: '150'
+        default: '500'
       backfill_category:
         description: 'Restrict the backfill queue to one AMFI category (blank = all)'
         required: false
@@ -22,7 +20,7 @@ on:
       time_budget:
         description: 'Seconds to spend backfilling before stopping'
         required: false
-        default: '2400'
+        default: '2700'
       store_navs:
         description: "Store the day's NAV snapshot alongside the metadata"
         required: false
@@ -82,10 +80,10 @@ jobs:
       - name: Refresh the catalogue and backfill a slice of history
         id: refresh
         env:
-          BACKFILL: ${{ inputs.backfill || '150' }}
+          BACKFILL: ${{ inputs.backfill || '500' }}
           BACKFILL_CATEGORY: ${{ inputs.backfill_category }}
           BACKFILL_FUND_HOUSE: ${{ inputs.backfill_fund_house }}
-          TIME_BUDGET: ${{ inputs.time_budget || '2400' }}
+          TIME_BUDGET: ${{ inputs.time_budget || '2700' }}
           STORE_NAVS: ${{ github.event_name != 'workflow_dispatch' || inputs.store_navs }}
         run: |
           set -euo pipefail

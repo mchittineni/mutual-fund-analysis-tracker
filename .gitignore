@@ -28,3 +28,6 @@ data/latest_fund_performance.csv
 .coverage
 coverage.xml
 htmlcov/
+
+# Streamlit local secrets (the app needs none, but never commit them)
+.streamlit/secrets.toml

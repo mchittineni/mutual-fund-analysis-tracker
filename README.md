@@ -94,6 +94,8 @@ These are the rules the code enforces, not aspirations:
 | [src/report.py](src/report.py) | Markdown / HTML / JSON / CSV rendering, inline SVG charts |
 | [main_pipeline.py](main_pipeline.py) | CLI with meaningful exit codes |
 | [dashboard.py](dashboard.py) | Streamlit UI over the analysis engine |
+| [streamlit_app.py](streamlit_app.py) | Entry point Streamlit Community Cloud auto-detects |
+| [src/bootstrap.py](src/bootstrap.py) | First-load data fetch for hosted deployments |
 
 ---
 
@@ -185,7 +187,7 @@ real behavioural risk for the metric layer.
 ## Development
 
 ```bash
-pip install -r requirements-dev.txt
+pip install -r requirements-dev.txt      # add -r requirements-notebook.txt for the notebook
 pre-commit install                       # lint + format on commit
 pre-commit install --hook-type pre-push  # tests before push
 
@@ -221,6 +223,45 @@ series must regress to beta 2.0) rather than re-baselining on previous output.
   fund moved opposite to the benchmark in those months — a correlation signal, not skill.
 - **Not modelled:** taxes, exit loads, expense-ratio changes, dividend/IDCW plans (growth-option
   NAVs only), and survivorship bias in the chosen universe.
+
+---
+
+## Deploying the dashboard
+
+The dashboard runs locally with `streamlit run dashboard.py`. To host it on
+[Streamlit Community Cloud](https://share.streamlit.io):
+
+1. Point the app at this repository, branch `main`, main file **`streamlit_app.py`**.
+2. Deploy. No secrets are required — AMFI's NAV endpoint is unauthenticated.
+
+**The one thing worth understanding: the filesystem is ephemeral.** Community Cloud wipes the
+container on every restart, redeploy, and wake-from-sleep, so the SQLite database written by a
+previous run is gone. [`src/bootstrap.py`](src/bootstrap.py) handles that by fetching NAV history on
+first load (roughly 10–15 seconds, once per container) and caching it with `st.cache_resource`. A
+warm container never re-downloads; the sidebar's **⤓ Fetch NAVs** button forces a refresh.
+
+If the fetch fails, the app says so and offers a retry. It **never falls back to synthetic data** —
+a public dashboard silently showing fabricated returns is the worst failure this project could have.
+
+| Variable | Default | Effect on a deployment |
+|---|---|---|
+| `MF_AUTO_BOOTSTRAP` | `1` | Set to `0` if you mount a pre-built database and the app must never hit the network |
+| `MF_CACHE_TTL` | `900` | Seconds before a cached analysis is recomputed |
+| `MF_BENCHMARK_SCHEME` | `120716` | Benchmark used for alpha, beta, and capture ratios |
+| `MF_RISK_FREE_RATE` | `0.065` | Default position of the risk-free slider |
+
+Set these in the Community Cloud app settings; `config.py` reads its environment at import time, so
+they must be present before the process starts.
+
+Two caveats worth knowing before you share the URL:
+
+- **There is no authentication.** Community Cloud apps are public by default. The data is public
+  NAV history, but the deployment carries your name.
+- **A cold start hits AMFI.** If AMFI is unreachable the app shows an error within ~5 seconds
+  (a bounded reachability probe runs before `mftool`'s own unbounded call) rather than hanging.
+
+[`.streamlit/config.toml`](.streamlit/config.toml) holds the theme and server settings. Secrets
+never belong there — it is committed.
 
 ---
 

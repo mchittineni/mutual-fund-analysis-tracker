@@ -23,6 +23,8 @@ three ways: a **GitHub Actions job summary**, downloadable **artifacts**, and a 
 | **Benchmark-relative** | CAPM beta, annualised Jensen's alpha, R², tracking error, information ratio, up/down capture, 1Y excess return |
 | **Consistency** | Rolling 3-year return distribution — worst / median / best, % positive, % above the risk-free rate |
 | **Trend** | 50D & 200D SMAs with a signal that stays `INSUFFICIENT_HISTORY` until the window is genuinely full |
+| **Category-relative** | Percentile rank and quartile against the funds in the same AMFI category, direction-corrected so 100 is always good |
+| **Composite** | A weighted score whose four components are always shown alongside it, and which is withheld entirely when the peer set is too thin |
 
 Every metric returns `None` rather than a fabricated number when the history is too short, and
 the report renders that as `—`, never as `0.00`.
@@ -49,38 +51,61 @@ These are the rules the code enforces, not aspirations:
    so they cannot disagree about the same fund.
 5. **Restatements are updates, not conflicts.** AMFI revises NAVs; the database upserts them
    instead of ignoring the second write.
+6. **A single number never travels alone.** The composite score always ships its components, and
+   it is withheld rather than estimated when fewer than five comparable funds exist — a percentile
+   against four peers is noise dressed as precision.
+7. **Compare like with like.** Ranking happens inside AMFI's own scheme categories, so the peer set
+   is the regulator's definition rather than a judgement call made here.
 
 ---
 
 ## Architecture
 
+Two ingestion paths, because the two costs are wildly different: the whole universe
+arrives in one request, while full price history costs one request *per fund*.
+
 ```text
-                 ┌──────────────┐
-   AMFI ────────▶│ fetch_amfi   │ retries + backoff, provenance, audited runs
-   (mftool)      │  _data.py    │
-                 └──────┬───────┘
-                        ▼
-                 ┌──────────────┐
-                 │ db_manager   │ SQLite: UPSERT, WAL, indexes, migrations,
-                 │              │ ingestion_runs audit trail
-                 └──────┬───────┘
-                        ▼
-                 ┌──────────────┐
-                 │ validation   │ 11 checks → CRITICAL / WARNING / INFO
-                 └──────┬───────┘
-                        ▼
-        ┌───────────────────────────────┐
-        │ metrics.py  (pure functions)  │  returns, risk, benchmark, XIRR
-        └───────────────┬───────────────┘
-                        ▼
-                 ┌──────────────┐
-                 │ analyzer.py  │ ranking + interpreted insights
-                 └──────┬───────┘
-              ┌─────────┼──────────┬──────────────┐
-              ▼         ▼          ▼              ▼
-        report.md   index.html  report.json   dashboard.py
-        (Actions    (Pages)     (machine       (Streamlit)
-         summary)               readable)
+  AMFI NAVAll.txt          AMFI per-scheme history
+  (1 request,              (1 request per fund,
+   ~14,000 schemes)         full NAV history)
+        │                          │
+        ▼                          ▼
+ ┌──────────────┐          ┌──────────────┐
+ │ catalogue.py │          │ fetch_amfi   │ retries + backoff, provenance,
+ │              │          │  _data.py    │ audited runs
+ │ metadata +   │          └──────┬───────┘
+ │ today's NAV  │                 │
+ └──────┬───────┘                 │
+        └──────────┬──────────────┘
+                   ▼
+            ┌──────────────┐
+            │ db_manager   │ SQLite: UPSERT, WAL, indexes, migrations,
+            │              │ ingestion_runs audit trail
+            └──────┬───────┘
+                   ▼
+            ┌──────────────┐
+            │ validation   │ 11 checks → CRITICAL / WARNING / INFO
+            └──────┬───────┘
+                   ▼
+   ┌───────────────────────────────┐
+   │ metrics.py  (pure functions)  │  returns, risk, benchmark, XIRR
+   └───────────────┬───────────────┘
+                   ▼
+            ┌──────────────┐
+            │  peers.py    │ percentile rank within the AMFI category
+            └──────┬───────┘
+              ┌────┴─────┐
+              ▼          ▼
+     ┌──────────────┐  ┌──────────────┐
+     │ analyzer.py  │  │ screener.py  │ filter + composite score
+     │ ranking +    │  │ (components  │
+     │ insights     │  │  always shown)│
+     └──────┬───────┘  └──────┬───────┘
+            ├─────────┬───────┴──────┬──────────────┐
+            ▼         ▼              ▼              ▼
+      report.md   index.html   report.json     dashboard.py
+      (Actions    (Pages)      (machine         (Streamlit)
+       summary)                readable)
 ```
 
 | File | Responsibility |
@@ -88,8 +113,11 @@ These are the rules the code enforces, not aspirations:
 | [src/config.py](src/config.py) | Paths, universe, benchmark, financial assumptions, thresholds — all env-overridable |
 | [src/db_manager.py](src/db_manager.py) | Schema, in-place migrations, upserts, ingestion audit, reads |
 | [src/fetch_amfi_data.py](src/fetch_amfi_data.py) | AMFI ingestion with retries; gated synthetic fallback |
+| [src/catalogue.py](src/catalogue.py) | Full-universe ingestion from `NAVAll.txt`; budgeted history backfill |
 | [src/validation.py](src/validation.py) | Data-quality gate |
 | [src/metrics.py](src/metrics.py) | Pure quantitative core (unit-tested against closed-form answers) |
+| [src/peers.py](src/peers.py) | Category-relative percentile ranking |
+| [src/screener.py](src/screener.py) | Screening and composite scoring, with visible components |
 | [src/analyzer.py](src/analyzer.py) | Orchestration, ranking, insight generation |
 | [src/report.py](src/report.py) | Markdown / HTML / JSON / CSV rendering, inline SVG charts |
 | [main_pipeline.py](main_pipeline.py) | CLI with meaningful exit codes |
@@ -106,6 +134,8 @@ These are the rules the code enforces, not aspirations:
 pip install -r requirements.txt
 
 python main_pipeline.py                         # fetch, analyse, publish
+python -m src.catalogue --backfill 100          # every scheme in India + some history
+python -m src.screener --min cagr_3y_pct=12     # screen and score what you have
 streamlit run dashboard.py                      # interactive dashboard
 ```
 
@@ -128,6 +158,64 @@ python main_pipeline.py --synthetic-only         # never contact AMFI (tests, CI
 | `1` | Unexpected error |
 | `2` | Ingestion failed (network / mftool / no data) |
 | `3` | Critical data-quality findings with `--fail-on-critical` |
+
+### Covering every mutual fund in India
+
+AMFI publishes its entire universe — roughly 14,000 schemes — in one file,
+[`NAVAll.txt`](https://www.amfiindia.com/spages/NAVAll.txt). `mftool` fetches that same file but
+keeps only the code and name, **discarding the section headers that carry the scheme type, the
+category, and the fund house**. Parsing it directly gets all of that plus both ISINs and the day's
+NAV from a single HTTP request.
+
+```bash
+python -m src.catalogue                          # every scheme + today's NAV, 1 request
+python -m src.catalogue --no-navs                # metadata only
+python -m src.catalogue --backfill 200           # + full history for 200 funds that lack it
+python -m src.catalogue --backfill 500 --time-budget 1800   # ...and stop after 30 minutes
+python -m src.catalogue --backfill-category "Equity Scheme - Small Cap Fund" --backfill 50
+python -m src.catalogue --from-file NAVAll.txt   # parse a saved snapshot, no network
+```
+
+The two costs are what shape the design:
+
+| | Catalogue | History |
+|---|---|---|
+| Requests | **1** for all ~14,000 schemes | **1 per scheme** |
+| Returns | Metadata, ISINs, today's NAV | Full NAV history |
+| Practical cadence | Daily | A slice per run, indefinitely |
+
+So a daily catalogue run does double duty: it keeps the universe current, and it accumulates one NAV
+per scheme per day, growing a real history for every fund over time. `--backfill` fills in the past
+for the funds closest to being analysable first, and `--time-budget` stops it cleanly before a
+runner timeout — successive runs complete the universe without any single run being long.
+
+### Screening and scoring
+
+```bash
+python -m src.screener --category "Equity Scheme - Large Cap Fund"
+python -m src.screener --min cagr_3y_pct=12 --max volatility_pct=18
+python -m src.screener --fund-house HDFC --sort-by sharpe_ratio --limit 10
+python -m src.screener --explain 119598        # why one fund scores what it does
+python -m src.screener --csv build/screen.csv
+```
+
+The composite score is the most dangerous thing in this repository — one number invites a decision
+while hiding everything that produced it — so three rules constrain it:
+
+1. **The components always travel with the score.** Every table ships `score_returns`,
+   `score_risk_adjusted`, `score_drawdown`, and `score_consistency` beside `score`. A 68 built from
+   95 on returns and 12 on drawdown is a different fund from a flat 68, and the reader must be able
+   to see which one they are looking at.
+2. **The inputs are category percentiles, not raw values.** Scoring a liquid fund's 6% against a
+   small-cap fund's 24% would rank the entire debt universe last for doing exactly its job. Ranking
+   happens *within* AMFI's own categories, and metrics where lower is better (volatility, VaR,
+   tracking error) are inverted, so 100 always means good.
+3. **A thin peer set produces no score at all.** Below five comparable funds a percentile is noise,
+   so the score is absent rather than confident-looking. A missing metric renormalises the remaining
+   weights instead of counting as zero — a fund is not penalised for being young.
+
+The weights (returns 35%, risk-adjusted 35%, drawdown 20%, consistency 10%) are editorial, not
+derived, and overridable per call. No weighting turns this into advice.
 
 ### Configuration
 
@@ -170,6 +258,30 @@ on every call, so a cache miss costs nothing but minutes.
 **One-time setup:** Settings → Pages → Build and deployment → Source: **GitHub Actions**. Until that
 is enabled the publish job is skipped, and the summary plus artifacts still work.
 
+### Filling the universe on a schedule
+
+[`.github/workflows/catalogue.yml`](.github/workflows/catalogue.yml) runs daily at 01:00 UTC
+(06:30 IST), an hour and a half before the analysis pipeline, and does two things per run:
+
+1. **Refresh the catalogue** — one request, every scheme, metadata plus the day's NAV.
+2. **Backfill a slice of history** — up to 150 funds by default, stopping at a 40-minute budget so
+   the job ends gracefully with its work saved rather than being killed at the runner timeout.
+
+The job summary shows coverage by category and a before/after table of what the run added, so
+progress toward full coverage is visible on every run rather than inferred. The database is carried
+between runs through the Actions cache under the same `nav-db-` key prefix the pipeline uses — what
+the catalogue fills in, the pipeline analyses — and is saved on `always()`, because a partial
+backfill is still progress and discarding it would mean starting over tomorrow.
+
+Manual dispatch accepts `backfill`, `backfill_category`, `backfill_fund_house`, `time_budget`, and
+`store_navs`; every input is bound through `env:` and read as a shell variable, so none can be
+executed as shell.
+
+> The `NAVAll.txt` parser is covered by tests against a fixture in AMFI's documented format,
+> including its awkward cases (a missing NAV, a short line, a duplicate scheme, free-text notices).
+> A feed whose format changes parses to zero schemes, which the CLI reports as **exit 2** with a
+> pointer at `parse_navall()` rather than silently writing an empty catalogue.
+
 ### CI
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push and pull request:
@@ -177,7 +289,7 @@ is enabled the publish job is skipped, and the summary plus artifacts still work
 | Job | What it does |
 |---|---|
 | **Quality** | Runs the *same* pre-commit hooks you run locally — ruff lint, ruff format, actionlint, gitleaks, notebook-output stripping, and the guards against committing a database or a generated report. CI and a clean checkout cannot disagree. |
-| **Tests** | The full suite on Python 3.13 with coverage, publishing a pass/fail/coverage table to the run summary. Currently **125 tests, ~94% line coverage**. |
+| **Tests** | The full suite on Python 3.13 with coverage, publishing a pass/fail/coverage table to the run summary. Currently **208 tests**, including a headless run of the real Streamlit app. |
 | **Smoke** | Runs the real pipeline end to end with `--synthetic-only`, so it never depends on AMFI being reachable, and asserts every artifact exists, that the synthetic data is labelled in all three formats, and that `index.html` is still self-contained (no external assets, no scripts). |
 
 Actions are pinned to commit SHAs, and [Dependabot](.github/dependabot.yml) keeps both the actions

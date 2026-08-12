@@ -7,6 +7,9 @@ meant the dashboard and the report could disagree about the same fund. One
 analysis engine, several presentations.
 
     streamlit run dashboard.py
+
+On a hosted deployment the filesystem is ephemeral, so an empty database is the
+normal first-load state rather than an error; see `src/bootstrap.py`.
 """
 
 from __future__ import annotations
@@ -14,7 +17,7 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
-from src import analyzer, config, db_manager, metrics
+from src import analyzer, bootstrap, config, db_manager, metrics
 
 try:
     import plotly.express as px
@@ -37,12 +40,12 @@ st.set_page_config(
 # ---------------------------------------------------------------------------
 
 
-@st.cache_data(ttl=900, show_spinner="Loading fund catalogue…")
+@st.cache_data(ttl=config.CACHE_TTL_SECONDS, show_spinner="Loading fund catalogue…")
 def load_catalogue() -> pd.DataFrame:
     return db_manager.scheme_catalogue()
 
 
-@st.cache_data(ttl=900, show_spinner="Computing performance and risk metrics…")
+@st.cache_data(ttl=config.CACHE_TTL_SECONDS, show_spinner="Computing performance and risk metrics…")
 def run_analysis(codes: tuple[str, ...], benchmark: str | None, risk_free: float):
     """Cached analysis. Returns the flat metric frame plus objects the UI needs.
 
@@ -54,21 +57,41 @@ def run_analysis(codes: tuple[str, ...], benchmark: str | None, risk_free: float
     )
 
 
-@st.cache_data(ttl=900)
+@st.cache_data(ttl=config.CACHE_TTL_SECONDS)
 def load_runs() -> pd.DataFrame:
     return db_manager.recent_runs(limit=5)
 
 
+# `cache_resource` rather than `cache_data`: this is a side effect that must run
+# at most once per container, not a value to memoise per session. On Streamlit
+# Community Cloud the filesystem is wiped on every restart, so this is what keeps
+# a hosted deployment from greeting visitors with an empty database.
+@st.cache_resource(show_spinner="Fetching NAV history from AMFI (first load only)…")
+def bootstrap_data() -> bootstrap.BootstrapResult:
+    config.ensure_directories()
+    return bootstrap.ensure_database(enabled=config.AUTO_BOOTSTRAP)
+
+
+boot = bootstrap_data()
 catalogue = load_catalogue()
 
 if catalogue.empty:
     st.title("📈 Indian Mutual Fund Tracker")
-    st.warning(
-        "The database is empty. Run the pipeline first:\n\n"
-        "```bash\npython main_pipeline.py\n```\n\n"
-        "For offline development without AMFI access, add `--allow-synthetic` "
-        "(the data will be clearly labelled as generated)."
-    )
+    if boot.status == "failed":
+        st.error(f"**Could not load NAV data.** {boot.message}", icon="🚨")
+        if st.button("Try again"):
+            st.cache_resource.clear()
+            st.cache_data.clear()
+            st.rerun()
+    else:
+        st.warning(
+            "The database is empty. Populate it with:\n\n"
+            "```bash\npython main_pipeline.py\n```\n\n"
+            "For offline development without AMFI access, use `--synthetic-only` "
+            "(the data will be clearly labelled as generated)."
+        )
+        if boot.status == "skipped":
+            st.caption(boot.message)
     st.stop()
 
 # ---------------------------------------------------------------------------
@@ -121,11 +144,21 @@ risk_free = (
     / 100.0
 )
 
-if st.sidebar.button("↻ Refresh data", use_container_width=True):
+col_reload, col_fetch = st.sidebar.columns(2)
+if col_reload.button("↻ Recompute", width="stretch", help="Re-read the database"):
     st.cache_data.clear()
+    st.rerun()
+if col_fetch.button("⤓ Fetch NAVs", width="stretch", help="Pull fresh NAVs from AMFI"):
+    with st.spinner("Fetching from AMFI…"):
+        refreshed = bootstrap.ensure_database(force=True)
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    (st.sidebar.success if refreshed.ok else st.sidebar.error)(refreshed.message)
     st.rerun()
 
 st.sidebar.divider()
+if boot.status == "fetched":
+    st.sidebar.caption(f"Bootstrapped this session: {boot.message}")
 runs = load_runs()
 if not runs.empty:
     latest = runs.iloc[0]
@@ -202,7 +235,7 @@ with overview_tab:
         ]
         st.dataframe(
             styled(frame[[c for c in columns if c in frame]]),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config={
                 "scheme_name": st.column_config.TextColumn("Scheme", width="large"),
@@ -245,7 +278,7 @@ with risk_tab:
         ]
         st.dataframe(
             styled(frame[[c for c in columns if c in frame]]),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
         st.caption(
@@ -273,7 +306,7 @@ with risk_tab:
                         for s in benched
                     ]
                 ),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
             st.caption(
@@ -299,7 +332,7 @@ with risk_tab:
                         for s in rolling
                     ]
                 ),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
             st.caption(
@@ -351,7 +384,7 @@ with chart_tab:
                     ]
                 },
             )
-            st.plotly_chart(figure, use_container_width=True)
+            st.plotly_chart(figure, width="stretch")
 
             st.subheader("Drawdown from running peak")
             dd_figure = go.Figure()
@@ -364,7 +397,7 @@ with chart_tab:
                 yaxis_title="Drawdown (%)",
                 margin={"l": 0, "r": 0, "t": 10, "b": 0},
             )
-            st.plotly_chart(dd_figure, use_container_width=True)
+            st.plotly_chart(dd_figure, width="stretch")
         else:
             st.line_chart(growth)
             st.subheader("Drawdown from running peak")
@@ -404,7 +437,7 @@ with quality_tab:
                     for f in findings
                 ]
             ),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
     else:
@@ -414,20 +447,25 @@ with quality_tab:
     if result.quality.coverage:
         st.dataframe(
             pd.DataFrame(result.quality.coverage).T.reset_index(names="scheme_code"),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
     st.subheader("Assumptions")
     st.dataframe(
-        pd.DataFrame(result.assumptions.items(), columns=["Assumption", "Value"]),
-        use_container_width=True,
+        # Values are deliberately mixed types (rates, day counts, prose), and Arrow
+        # cannot serialise a mixed column -- render everything as text.
+        pd.DataFrame(
+            [(k, str(v)) for k, v in result.assumptions.items()],
+            columns=["Assumption", "Value"],
+        ),
+        width="stretch",
         hide_index=True,
     )
 
     if not runs.empty:
         st.subheader("Ingestion history")
-        st.dataframe(runs, use_container_width=True, hide_index=True)
+        st.dataframe(runs, width="stretch", hide_index=True)
 
 with detail_tab:
     if not result.schemes:
@@ -499,7 +537,7 @@ with detail_tab:
         with st.expander("Raw NAV history"):
             st.dataframe(
                 nav.sort_index(ascending=False).rename("NAV").reset_index(),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
             st.download_button(

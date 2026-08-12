@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import random
+import socket
 import sqlite3
 import time
 from collections.abc import Callable, Sequence
@@ -111,6 +112,25 @@ def _with_retries(
     raise FetchError(f"{description} failed after {max_retries} attempts: {last_error}")
 
 
+def amfi_reachable(
+    host: str = config.AMFI_HOST, timeout: float = config.FETCH_CONNECT_TIMEOUT
+) -> bool:
+    """Bounded TCP probe of AMFI before the unbounded library call.
+
+    `Mftool()` downloads the scheme list in its constructor using a session with
+    no timeout, so an unreachable host costs a full OS connect timeout (~75s)
+    every attempt. A 5-second socket probe turns that into a fast, clear failure.
+    Raw sockets rather than an HTTP request: this asks "is the host up?", needs no
+    dependency, and cannot be slowed down by a redirect chain.
+    """
+    try:
+        with socket.create_connection((host, 443), timeout=timeout):
+            return True
+    except OSError as exc:
+        logger.warning("AMFI (%s) is unreachable: %s", host, exc)
+        return False
+
+
 def _parse_history(code: str, history: dict) -> list[tuple[str, str, float]]:
     """Convert an mftool history payload into ``(code, iso_date, nav)`` tuples.
 
@@ -133,10 +153,18 @@ def _parse_history(code: str, history: dict) -> list[tuple[str, str, float]]:
     return records
 
 
-def fetch_scheme(mf, code: str) -> tuple[dict | None, list[tuple[str, str, float]]]:
+def fetch_scheme(
+    mf, code: str, max_retries: int = config.FETCH_MAX_RETRIES
+) -> tuple[dict | None, list[tuple[str, str, float]]]:
     """Fetch one scheme's metadata and full NAV history from AMFI."""
-    details = _with_retries(lambda: mf.get_scheme_details(code), f"scheme_details({code})")
-    history = _with_retries(lambda: mf.get_scheme_historical_nav(code), f"historical_nav({code})")
+    details = _with_retries(
+        lambda: mf.get_scheme_details(code), f"scheme_details({code})", max_retries=max_retries
+    )
+    history = _with_retries(
+        lambda: mf.get_scheme_historical_nav(code),
+        f"historical_nav({code})",
+        max_retries=max_retries,
+    )
     if not history or "data" not in history:
         raise FetchError(f"scheme {code}: history payload empty")
     return details, _parse_history(code, history)
@@ -235,6 +263,7 @@ def fetch_and_store_funds(
     allow_synthetic: bool = False,
     synthetic_only: bool = False,
     polite_delay: float = config.FETCH_POLITE_DELAY_SECONDS,
+    max_retries: int = config.FETCH_MAX_RETRIES,
 ) -> FetchResult:
     """Fetch every requested scheme into SQLite and return an audited result.
 
@@ -273,11 +302,32 @@ def fetch_and_store_funds(
             result.synthetic = list(schemes)
             result.succeeded = list(schemes)
         else:
-            mf = Mftool()
-            for index, code in enumerate(schemes):
+            # Mftool's constructor downloads the full scheme list, so it is a
+            # network call and the first thing that fails when AMFI is
+            # unreachable. Left bare it raises a raw requests exception, which
+            # escapes as an "unexpected error" (exit 1) instead of an ingestion
+            # failure (exit 2) and shows a urllib3 traceback to a dashboard user.
+            try:
+                if not amfi_reachable():
+                    raise FetchError(
+                        f"{config.AMFI_HOST} is not reachable "
+                        f"(no TCP connection within {config.FETCH_CONNECT_TIMEOUT:.0f}s). "
+                        "Check your network, or use stored data with --skip-fetch."
+                    )
+                mf = _with_retries(Mftool, "AMFI connection", max_retries=max_retries)
+            except FetchError as exc:
+                if not allow_synthetic:
+                    raise
+                logger.warning("%s -- falling back to synthetic data", exc)
+                result.rows_written = generate_synthetic_history(conn, schemes)
+                result.synthetic = list(schemes)
+                result.succeeded = list(schemes)
+                mf = None
+
+            for index, code in enumerate(schemes if mf is not None else []):
                 logger.info("Fetching AMFI scheme %s (%s/%s)", code, index + 1, len(schemes))
                 try:
-                    details, records = fetch_scheme(mf, code)
+                    details, records = fetch_scheme(mf, code, max_retries=max_retries)
                     if details:
                         db_manager.upsert_scheme_info(
                             conn,

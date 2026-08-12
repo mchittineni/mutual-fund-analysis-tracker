@@ -1,0 +1,28 @@
+Scheme Code;ISIN Div Payout/ISIN Growth;ISIN Div Reinvestment;Scheme Name;Net Asset Value;Date
+
+Open Ended Schemes(Equity Scheme - Large Cap Fund)
+
+SBI Mutual Fund
+119598;INF200K01QX4;INF200K01QY2;SBI Blue Chip Fund - Direct Plan - Growth;104.8;12-Aug-2026
+119599;INF200K01QZ9;-;SBI Blue Chip Fund - Regular Plan - Growth;98.2231;12-Aug-2026
+
+HDFC Mutual Fund
+118989;INF179K01YV8;-;HDFC Top 100 Fund - Direct Plan - Growth;1123.456;12-Aug-2026
+
+Open Ended Schemes(Debt Scheme - Liquid Fund)
+
+HDFC Mutual Fund
+119063;INF179K01XQ0;INF179K01XR8;HDFC Liquid Fund - Direct Plan - Growth;4789.1234;12-Aug-2026
+
+ICICI Prudential Mutual Fund
+120716;INF109K012R4;-;ICICI Prudential Liquid Fund - Direct Plan - Growth;362.5;12-Aug-2026
+100001;-;-;A Scheme With No NAV Yet;N.A.;12-Aug-2026
+
+Close Ended Schemes(Income)
+
+Nippon India Mutual Fund
+112345;INF204K01XY7;-;Nippon India Fixed Horizon Fund - Series 1;12.3456;12-Aug-2026
+
+This line is a notice, not a fund house, and carries no semicolons.
+NOTAFUND;INF000000000;-;Missing enough fields
+119598;INF200K01QX4;INF200K01QY2;SBI Blue Chip Fund - Direct Plan - Growth;104.8;12-Aug-2026

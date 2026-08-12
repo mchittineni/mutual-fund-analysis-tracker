@@ -36,6 +36,29 @@ def isolated_environment(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def clear_streamlit_caches():
+    """Empty Streamlit's caches around every test.
+
+    `st.cache_data` and `st.cache_resource` are keyed by function and arguments
+    but stored *per process*, not per `AppTest`. Two dashboard tests in one
+    session therefore share them, and the second one silently gets the first
+    one's database -- which looks exactly like a broken feature. Clearing on both
+    sides keeps each test honest and keeps a failure local to its own test.
+    """
+    try:
+        import streamlit as st
+    except ImportError:  # pragma: no cover - streamlit is an optional extra
+        yield
+        return
+
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    yield
+    st.cache_data.clear()
+    st.cache_resource.clear()
+
+
 @pytest.fixture
 def db_path(tmp_path):
     """An isolated SQLite file per test."""

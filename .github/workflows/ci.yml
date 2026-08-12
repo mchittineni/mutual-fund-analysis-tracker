@@ -155,9 +155,12 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run the pipeline against synthetic data
+        # --synthetic-only, not --allow-synthetic: the latter only permits a
+        # *fallback*, so on a runner that can reach AMFI it produces real data and
+        # this job stops testing what it claims to test.
         run: |
           python main_pipeline.py \
-            --allow-synthetic \
+            --synthetic-only \
             --schemes 119598 125497 120503 \
             --benchmark 120716 \
             --output-dir build/reports \

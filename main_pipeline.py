@@ -45,6 +45,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="AMFI scheme codes to analyse (default: the configured universe)",
     )
     parser.add_argument(
+        "--all-analysable",
+        action="store_true",
+        help="Analyse every scheme in the database with enough stored NAV history, "
+        "instead of the configured universe. Use after `python -m src.catalogue` has "
+        "filled the database; implies --skip-fetch, since re-fetching thousands of "
+        "schemes one at a time would take hours",
+    )
+    parser.add_argument(
+        "--category",
+        default=None,
+        help="Restrict the universe to one AMFI category, e.g. "
+        "'Equity Scheme - Large Cap Fund'. Implies --all-analysable",
+    )
+    parser.add_argument(
+        "--fund-house",
+        default=None,
+        help="Restrict the universe to one AMC. Implies --all-analysable",
+    )
+    parser.add_argument(
+        "--max-schemes",
+        type=int,
+        default=100,
+        metavar="N",
+        help="Cap on the size of a database-derived universe. Ranked by history depth, "
+        "so the best-covered funds come first",
+    )
+    parser.add_argument(
         "--benchmark",
         default=config.BENCHMARK_SCHEME,
         help="AMFI scheme code used as the benchmark; 'none' disables relative metrics",
@@ -102,16 +129,95 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def resolve_universe(args: argparse.Namespace) -> tuple[list[str], bool]:
+    """Decide which schemes to analyse, and whether ingestion should be skipped.
+
+    Three sources, in order of precedence:
+
+    1. ``--schemes`` -- an explicit list.
+    2. ``--all-analysable`` / ``--category`` / ``--fund-house`` -- everything in
+       the database with enough stored history. This is what turns a filled
+       catalogue into an analysis: the catalogue knows about ~14,000 schemes, but
+       only the ones with real NAV history can be measured.
+    3. The configured universe -- a small hand-picked list.
+
+    A database-derived universe implies ``--skip-fetch``. Fetching full history is
+    one request per scheme, so re-fetching a few hundred would take longer than
+    the analysis itself -- and the data is already stored, which is the entire
+    reason those schemes qualified.
+    """
+    if args.schemes:
+        return [str(code) for code in args.schemes], args.skip_fetch
+
+    from_database = args.all_analysable or bool(args.category) or bool(args.fund_house)
+    if not from_database:
+        return [str(code) for code in config.DEFAULT_TARGET_SCHEMES], args.skip_fetch
+
+    found = db_manager.search_schemes(
+        args.db_path,
+        category=args.category,
+        fund_house=args.fund_house,
+        with_history_only=True,
+        limit=max(1, args.max_schemes),
+    )
+    if found.empty:
+        scope = (
+            f" in {args.category or args.fund_house}" if (args.category or args.fund_house) else ""
+        )
+        if args.category or args.fund_house:
+            # An explicit filter that matches nothing is a mistake worth stopping
+            # for -- silently analysing something else would answer a question
+            # the caller did not ask.
+            logger.error(
+                "No scheme%s has at least %s stored NAV observations. Run "
+                "`python -m src.catalogue --backfill 500 --backfill-category %r` first.",
+                scope,
+                config.MIN_OBSERVATIONS,
+                args.category or args.fund_house,
+            )
+            return [], True
+
+        # A bare --all-analysable against an empty database is the scheduled-job
+        # case: the Actions cache was evicted, or this is a first run. Falling
+        # back to the configured universe keeps the report publishing instead of
+        # failing outright -- but loudly, because a three-fund report where a
+        # few-hundred-fund one was expected must not pass unnoticed.
+        logger.warning(
+            "No scheme in the database has at least %s stored NAV observations, so "
+            "--all-analysable has nothing to analyse. Falling back to the configured "
+            "universe of %s scheme(s) and fetching it. Run "
+            "`python -m src.catalogue --backfill 500` to build coverage.",
+            config.MIN_OBSERVATIONS,
+            len(config.DEFAULT_TARGET_SCHEMES),
+        )
+        return [str(code) for code in config.DEFAULT_TARGET_SCHEMES], args.skip_fetch
+
+    codes = [str(code) for code in found["scheme_code"]]
+    logger.info(
+        "Universe from the database: %s scheme(s) with >= %s observations%s",
+        len(codes),
+        config.MIN_OBSERVATIONS,
+        " (capped by --max-schemes)" if len(codes) >= args.max_schemes else "",
+    )
+    return codes, True
+
+
 def run_pipeline(args: argparse.Namespace) -> int:
     """Execute fetch -> validate -> analyse -> report and return a process exit code."""
     config.ensure_directories()
-    schemes = [str(code) for code in (args.schemes or config.DEFAULT_TARGET_SCHEMES)]
+    schemes, skip_fetch = resolve_universe(args)
+    if not schemes:
+        return EXIT_ERROR
     benchmark = None if str(args.benchmark).lower() in {"none", ""} else str(args.benchmark)
 
-    logger.info("Universe: %s | benchmark: %s", ", ".join(schemes), benchmark or "disabled")
+    # A universe of 200 codes would make this line unreadable, so summarise past a
+    # handful and let --log-level DEBUG show the rest.
+    shown = ", ".join(schemes) if len(schemes) <= 8 else f"{len(schemes)} schemes"
+    logger.info("Universe: %s | benchmark: %s", shown, benchmark or "disabled")
+    logger.debug("Full universe: %s", ", ".join(schemes))
 
     # --- Step 1: ingest -------------------------------------------------
-    if args.skip_fetch:
+    if skip_fetch:
         logger.info("[1/3] Skipping ingestion (--skip-fetch)")
         db_manager.setup_database(args.db_path).close()
     else:

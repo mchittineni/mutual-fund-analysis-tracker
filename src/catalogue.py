@@ -287,10 +287,22 @@ def schemes_needing_history(
     if fund_house:
         query += " AND s.fund_house = ?"
         params.append(fund_house)
+    # Ordering is the difference between useful coverage in a fortnight and
+    # useless coverage in six weeks. Open-ended schemes come first because they
+    # are the ones anyone can actually buy: of AMFI's ~14,000 entries, ~4,700 are
+    # close-ended, overwhelmingly matured fixed-maturity plans whose history is
+    # of archival interest only. Within that, schemes closest to the analysable
+    # threshold come first, so each run converts as many funds as it can.
     query += """
          GROUP BY s.scheme_code
         HAVING observations < ?
-         ORDER BY observations DESC, s.scheme_code
+         ORDER BY CASE
+                    WHEN s.scheme_type LIKE 'Open Ended%' THEN 0
+                    WHEN s.scheme_type LIKE 'Interval%'   THEN 1
+                    ELSE 2
+                  END,
+                  observations DESC,
+                  s.scheme_code
          LIMIT ?
     """
     params.extend([min_observations, limit])

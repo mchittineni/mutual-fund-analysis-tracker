@@ -13,8 +13,9 @@ By participating you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
 Read these before writing code. A PR that violates one will be asked to change regardless of how
 well it is implemented.
 
-1. **Never fabricate financial data.** The synthetic NAV generator exists only for offline
-   development and is opt-in via `--allow-synthetic`. Every synthetic row is tagged
+1. **Never fabricate financial data.** The synthetic NAV generator is opt-in, via
+   `--allow-synthetic` (permit a fallback when the live fetch fails) or `--synthetic-only`
+   (force it, never contact AMFI). Every synthetic row is tagged
    `data_source='synthetic'` in SQLite, flagged by the validator, and declared at the top of every
    report. Do not add a code path that produces plausible-looking numbers when the real source is
    unavailable, and do not weaken the existing labelling.
@@ -50,8 +51,12 @@ pre-commit install --hook-type pre-push   # tests before push
 Populate a database without touching AMFI:
 
 ```bash
-python main_pipeline.py --allow-synthetic
+python main_pipeline.py --synthetic-only
 ```
+
+Mind the difference: `--allow-synthetic` only permits a *fallback* — AMFI is still tried first, so
+on a connected machine you get real data. `--synthetic-only` forces generated data and never opens a
+socket, which is what tests and CI need.
 
 ---
 

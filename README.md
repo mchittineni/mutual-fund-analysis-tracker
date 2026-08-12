@@ -33,7 +33,9 @@ the report renders that as `—`, never as `0.00`.
 
 These are the rules the code enforces, not aspirations:
 
-1. **Never fabricate financial data.** The synthetic NAV generator is opt-in (`--allow-synthetic`).
+1. **Never fabricate financial data.** The synthetic NAV generator is opt-in: `--allow-synthetic`
+   permits a fallback when the live fetch fails, `--synthetic-only` forces it and never contacts
+   AMFI.
    Every synthetic row is tagged `data_source='synthetic'` in SQLite, flagged by the validator,
    and shouted about at the top of every report. A silent offline fallback that invents returns
    is the single most dangerous thing a tool like this can do.
@@ -114,7 +116,8 @@ python main_pipeline.py --schemes 119598 125497 120503 --benchmark 120716
 python main_pipeline.py --skip-fetch             # re-analyse stored data, no network
 python main_pipeline.py --risk-free-rate 0.072   # move the Sharpe/alpha hurdle
 python main_pipeline.py --fail-on-critical       # CI gate on data quality
-python main_pipeline.py --allow-synthetic        # offline dev; data clearly labelled
+python main_pipeline.py --allow-synthetic        # offline dev: fall back if AMFI fails
+python main_pipeline.py --synthetic-only         # never contact AMFI (tests, CI)
 ```
 
 | Exit code | Meaning |
@@ -173,7 +176,7 @@ is enabled the publish job is skipped, and the summary plus artifacts still work
 |---|---|
 | **Quality** | Runs the *same* pre-commit hooks you run locally — ruff lint, ruff format, actionlint, gitleaks, notebook-output stripping, and the guards against committing a database or a generated report. CI and a clean checkout cannot disagree. |
 | **Tests** | The full suite on Python 3.13 with coverage, publishing a pass/fail/coverage table to the run summary. Currently **125 tests, ~94% line coverage**. |
-| **Smoke** | Runs the real pipeline end to end on synthetic data and asserts every artifact exists, that the synthetic data is labelled in all three formats, and that `index.html` is still self-contained (no external assets, no scripts). |
+| **Smoke** | Runs the real pipeline end to end with `--synthetic-only`, so it never depends on AMFI being reachable, and asserts every artifact exists, that the synthetic data is labelled in all three formats, and that `index.html` is still self-contained (no external assets, no scripts). |
 
 Actions are pinned to commit SHAs, and [Dependabot](.github/dependabot.yml) keeps both the actions
 and the Python dependencies current — with pandas and numpy deliberately ungrouped, since they carry

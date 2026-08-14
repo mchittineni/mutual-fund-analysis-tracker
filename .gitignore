@@ -31,3 +31,6 @@ htmlcov/
 
 # Streamlit local secrets (the app needs none, but never commit them)
 .streamlit/secrets.toml
+
+# Generated UI prototype (published as an artifact; regenerate rather than diff)
+prototypes.html

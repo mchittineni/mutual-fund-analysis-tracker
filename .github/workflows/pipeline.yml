@@ -2,8 +2,7 @@ name: Fund Analysis Pipeline
 
 on:
   schedule:
-    # 02:30 UTC every Monday = 08:00 IST, comfortably after AMFI publishes.
-    - cron: '30 2 * * 1'
+      - cron: '0 2 * * *'
   workflow_dispatch:
     inputs:
       schemes:

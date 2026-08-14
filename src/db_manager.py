@@ -295,6 +295,11 @@ def catalogue_stats(db_path: str | Path | None = None) -> dict[str, int]:
     cache has been saved -- reports zeros rather than raising. This is a progress
     probe, and a probe must never be the thing that fails the job it measures.
     """
+    if _remote_reads():
+        from src import remote_store
+
+        return remote_store.catalogue_stats()
+
     with connection(db_path) as conn:
         tables = {
             row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
@@ -338,6 +343,17 @@ def search_schemes(
     limit: int = 200,
 ) -> pd.DataFrame:
     """Search the catalogue. Powers the dashboard's fund browser."""
+    if _remote_reads():
+        from src import remote_store
+
+        return remote_store.search_schemes(
+            query=query,
+            category=category,
+            fund_house=fund_house,
+            with_history_only=with_history_only,
+            limit=limit,
+        )
+
     sql = """
         SELECT s.scheme_code, s.scheme_name, s.fund_house, s.scheme_type, s.scheme_category,
                COUNT(n.date) AS observations, MAX(n.date) AS last_date
@@ -401,6 +417,24 @@ def finish_run(
 # ---------------------------------------------------------------------------
 # Reads
 # ---------------------------------------------------------------------------
+#
+# Each read below can be served either from the local SQLite file or from the
+# hosted Postgres mirror, chosen by MF_STORAGE. The branch lives here, at the
+# boundary, so that everything upstream -- analyzer, screener, dashboard --
+# stays unaware of where a row came from.
+#
+# Writes are not mirrored: only the ingestion job writes, and it writes SQLite.
+
+
+def _remote_reads() -> bool:
+    """Whether this process should read from the mirror.
+
+    Imported lazily so that a deployment without psycopg, or without the mirror
+    configured, never pays for the import.
+    """
+    from src import remote_store
+
+    return remote_store.reads_enabled()
 
 
 def load_data(
@@ -411,6 +445,11 @@ def load_data(
     Columns: ``scheme_code, scheme_name, fund_house, scheme_category, date, nav,
     data_source``.
     """
+    if _remote_reads():
+        from src import remote_store
+
+        return remote_store.load_data(scheme_codes)
+
     query = """
         SELECT n.scheme_code,
                COALESCE(s.scheme_name, 'Unknown scheme ' || n.scheme_code) AS scheme_name,
@@ -435,6 +474,11 @@ def load_data(
 
 def scheme_catalogue(db_path: str | Path | None = None) -> pd.DataFrame:
     """One row per scheme with coverage statistics -- the dashboard's index."""
+    if _remote_reads():
+        from src import remote_store
+
+        return remote_store.scheme_catalogue()
+
     query = """
         SELECT s.scheme_code, s.scheme_name, s.fund_house, s.scheme_category,
                COUNT(n.date)  AS observations,

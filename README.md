@@ -5,10 +5,13 @@
 [![Python 3.13](https://img.shields.io/badge/python-3.13-blue.svg)](https://www.python.org/downloads/)
 [![Licence: MIT](https://img.shields.io/badge/licence-MIT-green.svg)](LICENSE)
 
+**[Live dashboard →](https://mutual-fund-analysis-tracker.streamlit.app/)**
+
 A data pipeline and analytics engine for Indian mutual funds. It pulls daily NAVs from
-**AMFI** via `mftool`, stores them in **SQLite** with full provenance, runs a validation gate,
-computes a **performance, risk, and benchmark-relative metric suite**, and publishes the analysis
-three ways: a **GitHub Actions job summary**, downloadable **artifacts**, and a self-contained
+**AMFI** via `mftool`, stores them in **SQLite** with full provenance, mirrors them to a hosted
+**Postgres** database so the dashboard can read them, runs a validation gate, computes a
+**performance, risk, and benchmark-relative metric suite**, and publishes the analysis three
+ways: a **GitHub Actions job summary**, downloadable **artifacts**, and a self-contained
 **GitHub Pages report**. A Streamlit dashboard and a Jupyter notebook read the same engine.
 
 ---
@@ -124,6 +127,61 @@ arrives in one request, while full price history costs one request *per fund*.
 | [dashboard.py](dashboard.py) | Streamlit UI over the analysis engine |
 | [streamlit_app.py](streamlit_app.py) | Entry point Streamlit Community Cloud auto-detects |
 | [src/bootstrap.py](src/bootstrap.py) | First-load data fetch for hosted deployments |
+| [src/remote_store.py](src/remote_store.py) | One-way push to hosted Postgres, and the read path back |
+
+---
+
+## Where the data lives
+
+The machine that can reach AMFI and the machine that serves the dashboard are not the
+same machine, and neither can be made into the other. GitHub Actions reaches AMFI but its
+filesystem is thrown away between runs. Streamlit Community Cloud serves the dashboard but
+its filesystem is thrown away too, and its egress may not reach AMFI at all. So a hosted
+Postgres database sits between them as the one durable thing both can reach:
+
+```text
+        AMFI
+          │  (only Actions can reach it)
+          ▼
+  ┌────────────────┐   COPY + upsert    ┌──────────────┐   SELECT   ┌──────────────┐
+  │ GitHub Actions │ ─────────────────▶ │   Postgres   │ ─────────▶ │  Streamlit   │
+  │  daily       │  last 5 years,     │  (Supabase)  │            │  any laptop  │
+  │ catalogue.py   │  ~3.5M rows,       │              │            │              │
+  │ + backfill     │  ~140 seconds      │              │            │              │
+  └───────┬────────┘                    └──────────────┘            └──────────────┘
+          │
+          └──▶ SQLite in an Actions cache (the job's own working copy)
+```
+
+SQLite remains the local format: faster, no secrets, and it keeps the test suite offline.
+The mirror is a push from it, never a replacement for it.
+
+**Reads choose their source explicitly**, via `MF_STORAGE`, at the `db_manager` boundary —
+so `analyzer`, `screener` and the dashboard never learn where a row came from:
+
+| Process | `MF_STORAGE` | Reads from |
+|---|---|---|
+| Catalogue job (CI) | unset → `sqlite` | its own cached SQLite |
+| Hosted dashboard | `supabase` | Postgres |
+| Local development | unset → `sqlite` | `data/mf_database.db` |
+
+The switch is deliberately *not* inferred from `MF_REMOTE_URL` being present. The catalogue
+job sets that URL in order to **write**; if it also flipped that job's reads, its
+before/after progress table would describe the mirror instead of the run it just did.
+
+**Why five years.** Measured against the real store: the full series is 9,374,642 NAV rows
+(~712 MB in Postgres) and does not fit Supabase's 500 MB free tier. Five years is
+~3.0M rows (~230 MB). Filtering by *scheme* instead was measured and rejected — 9.36M of
+those 9.37M rows already belong to analysable schemes, so time is the only lever that
+moves the number. Everything the analyzer computes survives the window except
+`cagr_since_inception`. Raise `MF_REMOTE_HISTORY_YEARS` on a paid tier.
+
+Verify a mirror at any time — this connects, reports, and writes nothing:
+
+```bash
+export MF_REMOTE_URL='postgresql://postgres.<ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres'
+python -m src.remote_store --check
+```
 
 ---
 
@@ -252,6 +310,15 @@ Every setting is env-overridable — no code change needed to retarget an enviro
 | `MF_EXTREME_MOVE_PCT` | `20` | Single-day move that triggers an outlier warning |
 | `MF_MIN_OBSERVATIONS` | `30` | Below this, a scheme is excluded as unanalysable |
 
+Hosted storage — see [Where the data lives](#where-the-data-lives):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MF_STORAGE` | `sqlite` | `supabase` to read from the hosted mirror instead of the local file |
+| `MF_REMOTE_URL` | *(unset)* | Postgres URI for the mirror. Unset means the mirror is off entirely |
+| `MF_REMOTE_HISTORY_YEARS` | `5` | Years of NAV history to push |
+| `MF_REMOTE_BATCH` | `50000` | Rows per COPY batch |
+
 ---
 
 ## How the analysis is presented (GitHub Actions)
@@ -290,6 +357,10 @@ is enabled the publish job is skipped, and the summary plus artifacts still work
 1. **Refresh the catalogue** — one request, every scheme, metadata plus the day's NAV.
 2. **Backfill a slice of history** — stopping at a 45-minute budget so the job ends gracefully with
    its work saved rather than being killed at the runner timeout.
+3. **Publish to the hosted database** — the step that makes any of it reachable from the dashboard.
+   It runs on `always()`, because a partial catalogue is still worth mirroring, and it is a no-op
+   when the `MF_REMOTE_URL` secret is unset. A missing configuration exits 0 rather than failing:
+   a red job for an optional feature only teaches people to ignore red jobs.
 
 It runs four times a day rather than once, because the backfill is the bottleneck: the catalogue
 only changes when AMFI publishes, but history is one request per scheme.
@@ -316,7 +387,7 @@ executed as shell.
 | Job | What it does |
 |---|---|
 | **Quality** | Runs the *same* pre-commit hooks you run locally — ruff lint, ruff format, actionlint, gitleaks, notebook-output stripping, and the guards against committing a database or a generated report. CI and a clean checkout cannot disagree. |
-| **Tests** | The full suite on Python 3.13 with coverage, publishing a pass/fail/coverage table to the run summary. Currently **208 tests**, including a headless run of the real Streamlit app. |
+| **Tests** | The full suite on Python 3.13 with coverage, publishing a pass/fail/coverage table to the run summary. Currently **250 tests**, including a headless run of the real Streamlit app. |
 | **Smoke** | Runs the real pipeline end to end with `--synthetic-only`, so it never depends on AMFI being reachable, and asserts every artifact exists, that the synthetic data is labelled in all three formats, and that `index.html` is still self-contained (no external assets, no scripts). |
 
 Actions are pinned to commit SHAs, and [Dependabot](.github/dependabot.yml) keeps both the actions
@@ -368,23 +439,63 @@ series must regress to beta 2.0) rather than re-baselining on previous output.
 ## Deploying the dashboard
 
 The dashboard runs locally with `streamlit run dashboard.py`. To host it on
-[Streamlit Community Cloud](https://share.streamlit.io):
+[Streamlit Community Cloud](https://share.streamlit.io), point the app at this repository,
+branch `main`, main file **`streamlit_app.py`** — then choose how it gets its data.
 
-1. Point the app at this repository, branch `main`, main file **`streamlit_app.py`**.
-2. Deploy. No secrets are required — AMFI's NAV endpoint is unauthenticated.
+**The thing to understand first: the filesystem is ephemeral.** Community Cloud wipes the
+container on every restart, redeploy, and wake-from-sleep, so any SQLite database written by a
+previous run is gone. There are two answers to that, and they behave very differently.
 
-**The one thing worth understanding: the filesystem is ephemeral.** Community Cloud wipes the
-container on every restart, redeploy, and wake-from-sleep, so the SQLite database written by a
-previous run is gone. [`src/bootstrap.py`](src/bootstrap.py) handles that by fetching NAV history on
-first load (roughly 10–15 seconds, once per container) and caching it with `st.cache_resource`. A
-warm container never re-downloads; the sidebar's **⤓ Fetch NAVs** button forces a refresh.
+### Reading the hosted mirror (recommended)
+
+Add both of these under **Settings → Secrets**, then reboot:
+
+```toml
+MF_REMOTE_URL = "postgresql://postgres.<ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres"
+MF_STORAGE = "supabase"
+```
+
+`MF_STORAGE` is the switch. With the URL alone the app still reads its local SQLite and
+nothing changes. Community Cloud exposes secrets as environment variables, so no code change
+is needed for them to land.
+
+A cold start becomes a query rather than a download, the app never touches AMFI, and it serves
+every scheme the catalogue job has filled in — thousands, not a handful.
+
+Three things that will bite, in the order they usually do:
+
+- **Use the session-pooler URI, port 5432.** Supabase's direct endpoint (`db.<ref>.supabase.co`)
+  is IPv6-only and Community Cloud is IPv4, so a direct URI fails as an unexplained connection
+  timeout. Port 6543 is transaction-mode pooling, which breaks the prepared statements psycopg
+  creates automatically.
+- **Row-level security fails silently.** A blocked read returns *zero rows*, not an error, so
+  the app renders "0 schemes catalogued" and looks like a data problem. `--check` reports the
+  policy picture per table for exactly this reason. A table's owner is exempt from its own RLS
+  unless `FORCE ROW LEVEL SECURITY` is set; any other role needs a `SELECT` policy.
+- **Free-tier projects pause after 7 days idle.** The scheduled catalogue job's writes keep it
+  awake — disable that workflow and the dashboard goes down with it.
+
+### Bootstrapping from AMFI instead
+
+Without `MF_STORAGE`, [`src/bootstrap.py`](src/bootstrap.py) fills an empty database on first
+load: it refreshes the full catalogue (every scheme AMFI publishes, one NAV each), then fetches
+full history for the seed schemes, caching the result with `st.cache_resource`. A warm container
+never re-downloads; the sidebar's **⤓ Fetch NAVs** button forces a refresh.
+
+This keeps the deployment self-contained, but note what it can and cannot give you: the picker
+lists the whole universe, while *analysable* funds start at the seed set and grow one NAV day at a
+time. It also assumes Community Cloud's egress can reach AMFI, which is not guaranteed.
 
 If the fetch fails, the app says so and offers a retry. It **never falls back to synthetic data** —
 a public dashboard silently showing fabricated returns is the worst failure this project could have.
 
 | Variable | Default | Effect on a deployment |
 |---|---|---|
-| `MF_AUTO_BOOTSTRAP` | `1` | Set to `0` if you mount a pre-built database and the app must never hit the network |
+| `MF_STORAGE` | `sqlite` | `supabase` reads the hosted mirror; anything else reads the local file |
+| `MF_REMOTE_URL` | *(unset)* | Postgres URI. Required when `MF_STORAGE=supabase` |
+| `MF_AUTO_BOOTSTRAP` | `1` | Set to `0` when the app must never hit the network |
+| `MF_BOOTSTRAP_CATALOGUE` | `1` | Set to `0` to bootstrap only `DEFAULT_TARGET_SCHEMES` |
+| `MF_DEFAULT_SELECTION` | `5` | Schemes pre-selected on first paint — a load-time budget, not a view of the universe |
 | `MF_CACHE_TTL` | `900` | Seconds before a cached analysis is recomputed |
 | `MF_BENCHMARK_SCHEME` | `120716` | Benchmark used for alpha, beta, and capture ratios |
 | `MF_RISK_FREE_RATE` | `0.065` | Default position of the risk-free slider |
@@ -392,12 +503,17 @@ a public dashboard silently showing fabricated returns is the worst failure this
 Set these in the Community Cloud app settings; `config.py` reads its environment at import time, so
 they must be present before the process starts.
 
-Two caveats worth knowing before you share the URL:
+Three caveats worth knowing before you share the URL:
 
 - **There is no authentication.** Community Cloud apps are public by default. The data is public
   NAV history, but the deployment carries your name.
-- **A cold start hits AMFI.** If AMFI is unreachable the app shows an error within ~5 seconds
-  (a bounded reachability probe runs before `mftool`'s own unbounded call) rather than hanging.
+- **In bootstrap mode, a cold start hits AMFI.** If AMFI is unreachable the app shows an error
+  within ~5 seconds (a bounded reachability probe runs before `mftool`'s own unbounded call)
+  rather than hanging. Mirror mode never makes that call.
+- **In mirror mode, the app holds database credentials.** `MF_REMOTE_URL` grants whatever the
+  role in it grants. A dedicated read-only role is the better shape than reusing the owner —
+  just create its `SELECT` policies at the same time, or RLS will hand the dashboard an empty
+  database.
 
 [`.streamlit/config.toml`](.streamlit/config.toml) holds the theme and server settings. Secrets
 never belong there — it is committed.

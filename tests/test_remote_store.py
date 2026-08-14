@@ -535,3 +535,23 @@ def test_db_manager_reads_sqlite_by_default(monkeypatch, local_db):
     monkeypatch.setattr(remote_store, "load_data", explode)
     frame = db_manager.load_data(local_db)
     assert len(frame) == 2
+
+
+def test_staging_tables_are_temporary(local_db, monkeypatch):
+    """Scratch tables must not outlive the sync that needed them.
+
+    A permanent staging table sits in the public schema forever, showing up in
+    every schema browser and security linter for a table that is empty by
+    contract between runs.
+    """
+    conn = FakeConnection()
+    monkeypatch.setattr(remote_store, "connect", lambda *_a, **_k: conn)
+    remote_store.sync(local_db, url="postgresql://x/y")
+
+    statements = " ".join(conn.statements())
+    assert "CREATE TEMP TABLE IF NOT EXISTS" in statements
+    assert "UNLOGGED" not in statements
+    # The LIKE source must always mean the real table, never a temp one
+    # shadowing it in the search path.
+    assert 'LIKE "public"."nav_history"' in statements
+    assert 'LIKE "public"."scheme_info"' in statements

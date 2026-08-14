@@ -248,15 +248,26 @@ def _merge(conn, staging: str, target: str, columns: Sequence[str], key: Sequenc
 
 
 def _create_staging(conn, staging: str, like: str) -> None:
+    """A per-session landing pad for COPY.
+
+    TEMP rather than a permanent table: staging is an implementation detail of
+    one sync, and a permanent one leaves scratch tables sitting in the public
+    schema for every schema browser and security linter to ask about. A temp
+    table is dropped when the connection closes, and lives in `pg_temp`, which
+    resolves ahead of `public` for the unqualified references below.
+
+    The LIKE source is schema-qualified for exactly that reason: it must always
+    mean the real table, never something shadowing it.
+    """
     from psycopg import sql
 
     with conn.cursor() as cur:
         cur.execute(
-            sql.SQL("CREATE UNLOGGED TABLE IF NOT EXISTS ")
+            sql.SQL("CREATE TEMP TABLE IF NOT EXISTS ")
             + sql.Identifier(staging)
             + sql.SQL(" (LIKE ")
-            + sql.Identifier(like)
-            + sql.SQL(" INCLUDING DEFAULTS)")
+            + sql.Identifier("public", like)
+            + sql.SQL(" INCLUDING DEFAULTS) ON COMMIT PRESERVE ROWS")
         )
         cur.execute(sql.SQL("TRUNCATE ") + sql.Identifier(staging))
     conn.commit()

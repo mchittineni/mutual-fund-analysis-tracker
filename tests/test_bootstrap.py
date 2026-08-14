@@ -11,8 +11,27 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from src import bootstrap, config, db_manager, fetch_amfi_data
+from src import bootstrap, catalogue, config, db_manager, fetch_amfi_data
+from tests.test_catalogue_and_peers import FIXTURE
 from tests.test_fetch_and_pipeline import FakeMftool
+
+
+@pytest.fixture(autouse=True)
+def catalogue_off_by_default(monkeypatch):
+    """Keep the catalogue step out of tests that are not about it.
+
+    It is on in production, and it downloads a 7 MB file. A test that wants it
+    passes ``catalogue=True`` and stubs the download.
+    """
+    monkeypatch.setattr(config, "BOOTSTRAP_CATALOGUE", False)
+
+
+@pytest.fixture
+def fake_catalogue(monkeypatch):
+    """Serve the sample NAVAll file instead of downloading it."""
+    text = FIXTURE.read_text(encoding="utf-8")
+    monkeypatch.setattr(catalogue, "fetch_navall", lambda *_a, **_k: text)
+    return text
 
 
 @pytest.fixture
@@ -156,6 +175,73 @@ def test_result_message_is_renderable(db_path, fake_amfi):
         bootstrap.ensure_database(db_path, schemes=["111111"], benchmark=None),
     ):
         assert isinstance(result.message, str) and result.message.strip()
+
+
+# --- catalogue step --------------------------------------------------------
+
+
+def test_bootstrap_catalogues_the_whole_universe_not_just_the_seed_list(
+    db_path, fake_amfi, fake_catalogue
+):
+    """The regression this fixes: a hosted app offering only three funds forever.
+
+    Bootstrapping used to fetch `DEFAULT_TARGET_SCHEMES` and nothing else, so the
+    dashboard's universe was a hardcoded list rather than what AMFI publishes.
+    """
+    fake_amfi(FakeMftool())
+    result = bootstrap.ensure_database(db_path, schemes=["111111"], benchmark=None, catalogue=True)
+    assert result.status == "fetched"
+    assert result.schemes_catalogued > len(config.DEFAULT_TARGET_SCHEMES)
+    stats = db_manager.catalogue_stats(db_path)
+    # At least the catalogued universe; the seed scheme adds its own row too.
+    assert stats["schemes"] >= result.schemes_catalogued
+    assert stats["categories"] > 1
+
+
+def test_catalogue_step_is_skippable(db_path, fake_amfi, monkeypatch):
+    def explode(*_args, **_kwargs):
+        raise AssertionError("catalogued despite catalogue=False")
+
+    monkeypatch.setattr(catalogue, "refresh_catalogue", explode)
+    fake_amfi(FakeMftool())
+    result = bootstrap.ensure_database(db_path, schemes=["111111"], benchmark=None, catalogue=False)
+    assert result.status == "fetched"
+    assert result.schemes_catalogued == 0
+
+
+def test_a_failed_catalogue_still_leaves_a_usable_dashboard(db_path, fake_amfi, monkeypatch):
+    """The seed fetch is what makes the app usable, so it must still run."""
+
+    def explode(*_args, **_kwargs):
+        raise fetch_amfi_data.FetchError("catalogue file moved")
+
+    monkeypatch.setattr(catalogue, "refresh_catalogue", explode)
+    fake_amfi(FakeMftool())
+    result = bootstrap.ensure_database(db_path, schemes=["111111"], benchmark=None, catalogue=True)
+    assert result.ok
+    assert result.rows_written > 0
+    assert result.schemes_catalogued == 0
+    assert "catalogue file moved" in result.message
+
+
+def test_catalogue_rows_survive_a_failed_seed_fetch(db_path, fake_catalogue, monkeypatch):
+    """A partial cold start is still progress: report the failure, keep the rows."""
+    monkeypatch.setattr(fetch_amfi_data, "MFTOOL_AVAILABLE", False)
+    result = bootstrap.ensure_database(db_path, schemes=["111111"], benchmark=None, catalogue=True)
+    assert result.status == "failed"
+    assert result.schemes_catalogued > 0
+    assert db_manager.catalogue_stats(db_path)["schemes"] > 0
+
+
+def test_catalogued_schemes_are_not_offered_until_they_have_history(db_path, fake_catalogue):
+    """Guards the dashboard's picker: one NAV per scheme analyses to nothing."""
+    conn = db_manager.setup_database(db_path)
+    try:
+        catalogue.refresh_catalogue(conn, text=fake_catalogue)
+    finally:
+        conn.close()
+    assert db_manager.catalogue_stats(db_path)["schemes"] > 0
+    assert db_manager.search_schemes(db_path, with_history_only=True, limit=50_000).empty
 
 
 # --- entry point -----------------------------------------------------------

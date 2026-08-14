@@ -25,6 +25,7 @@ run a command first.
 from __future__ import annotations
 
 import logging
+import sqlite3
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -32,6 +33,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Literal
 
+from src import catalogue as catalogue_module
 from src import config, db_manager, fetch_amfi_data
 
 logger = logging.getLogger(__name__)
@@ -50,6 +52,7 @@ class BootstrapResult:
     synthetic: bool = False
     last_nav_date: date | None = None
     duration_seconds: float = 0.0
+    schemes_catalogued: int = 0
 
     @property
     def ok(self) -> bool:
@@ -92,8 +95,19 @@ def ensure_database(
     allow_synthetic: bool = False,
     enabled: bool = True,
     max_retries: int = 1,
+    catalogue: bool | None = None,
 ) -> BootstrapResult:
     """Make sure the database holds NAV data, fetching from AMFI if it does not.
+
+    Two steps, because they answer two different questions. The catalogue answers
+    "what funds exist?" -- one download of AMFI's consolidated file, giving every
+    scheme its metadata and today's NAV. The seed fetch answers "what can I
+    analyse right now?" -- full history for a few funds, because a single NAV per
+    scheme is not enough for any metric. Without the first step a hosted
+    deployment offers only `DEFAULT_TARGET_SCHEMES`, however much AMFI publishes.
+
+    A catalogue failure is logged and carried in the message rather than raised:
+    the seed fetch is what makes the dashboard usable, so it still gets its turn.
 
     Returns a `BootstrapResult` in every case, including failure. Set ``force``
     to refresh a populated database (the sidebar's refresh button), and
@@ -123,9 +137,14 @@ def ensure_database(
     universe = [str(code) for code in (schemes or config.DEFAULT_TARGET_SCHEMES)]
     to_fetch = universe + ([str(benchmark)] if benchmark and str(benchmark) not in universe else [])
 
-    logger.info("Bootstrapping database with %s scheme(s)", len(to_fetch))
+    logger.info("Bootstrapping database with %s seed scheme(s)", len(to_fetch))
+    want_catalogue = config.BOOTSTRAP_CATALOGUE if catalogue is None else catalogue
     conn = db_manager.setup_database(db_path)
+    catalogued = 0
+    catalogue_note = ""
     try:
+        if want_catalogue:
+            catalogued, catalogue_note = _refresh_catalogue(conn)
         result = fetch_amfi_data.fetch_and_store_funds(
             to_fetch,
             conn=conn,
@@ -142,6 +161,7 @@ def ensure_database(
                 f"Could not fetch NAV data from AMFI: {exc}. The service may be "
                 "temporarily unavailable -- try again in a few minutes."
             ),
+            schemes_catalogued=catalogued,
             duration_seconds=time.monotonic() - started,
         )
     except Exception as exc:
@@ -149,6 +169,7 @@ def ensure_database(
         return BootstrapResult(
             status="failed",
             message=f"Unexpected error while fetching NAV data: {exc}",
+            schemes_catalogued=catalogued,
             duration_seconds=time.monotonic() - started,
         )
     finally:
@@ -158,7 +179,8 @@ def ensure_database(
     return BootstrapResult(
         status="fetched",
         message=(
-            f"Fetched {result.rows_written:,} NAV rows for "
+            (f"Catalogued {catalogued:,} scheme(s) from AMFI. " if catalogued else catalogue_note)
+            + f"Fetched {result.rows_written:,} NAV rows for "
             f"{len(result.succeeded)} of {len(to_fetch)} scheme(s)."
             + (f" Failed: {', '.join(result.failed)}." if result.failed else "")
         ),
@@ -167,4 +189,24 @@ def ensure_database(
         synthetic=result.used_synthetic,
         last_nav_date=latest,
         duration_seconds=time.monotonic() - started,
+        schemes_catalogued=catalogued,
     )
+
+
+def _refresh_catalogue(conn: sqlite3.Connection) -> tuple[int, str]:
+    """Ingest the full AMFI scheme universe. Returns ``(count, note)``.
+
+    Never raises. A dashboard that can list three funds is worth more than one
+    that shows a traceback because the catalogue file moved, so every failure
+    comes back as a note the caller can append to its message.
+    """
+    try:
+        result = catalogue_module.refresh_catalogue(conn)
+    except Exception as exc:
+        logger.warning("Catalogue refresh failed during bootstrap: %s", exc)
+        return 0, f"Could not catalogue the full AMFI universe ({exc}). "
+    if result.errors:
+        logger.warning("Catalogue refresh reported: %s", "; ".join(result.errors))
+        return result.schemes_written, ""
+    logger.info("Catalogued %s scheme(s) during bootstrap", result.schemes_written)
+    return result.schemes_written, ""

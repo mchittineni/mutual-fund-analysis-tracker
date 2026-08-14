@@ -12,6 +12,15 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+_FALSEY = {"0", "false", "no"}
+
+
+def _env_flag(name: str, *, default: bool) -> bool:
+    """Read a boolean environment variable, treating 0/false/no as off."""
+    raw = os.getenv(name)
+    return default if raw is None else raw.strip().lower() not in _FALSEY
+
+
 # --- Paths -----------------------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -75,9 +84,18 @@ AMFI_HOST = os.getenv("MF_AMFI_HOST", "www.amfiindia.com")
 # Community Cloud containers have an ephemeral filesystem, so the dashboard
 # fetches NAV data on first load when the database is empty. Set to 0 for a
 # deployment that mounts a pre-built database and must never hit the network.
-AUTO_BOOTSTRAP = os.getenv("MF_AUTO_BOOTSTRAP", "1").lower() not in {"0", "false", "no"}
+AUTO_BOOTSTRAP = _env_flag("MF_AUTO_BOOTSTRAP", default=True)
+# The bootstrap catalogues the whole AMFI universe before fetching seed history,
+# so a hosted deployment offers every scheme AMFI publishes today rather than the
+# handful hardcoded above. It costs one extra download (~7 MB) on a cold start.
+# Set to 0 to bootstrap DEFAULT_TARGET_SCHEMES alone.
+BOOTSTRAP_CATALOGUE = _env_flag("MF_BOOTSTRAP_CATALOGUE", default=True)
 # How long the hosted dashboard keeps a cached analysis before recomputing.
 CACHE_TTL_SECONDS = int(os.getenv("MF_CACHE_TTL", "900"))
+# Schemes the dashboard pre-selects on first paint. Every one is a full metric
+# computation before anything renders, so this is a load-time budget, not a view
+# of the universe -- the picker holds every analysable fund.
+DEFAULT_SELECTION_SIZE = int(os.getenv("MF_DEFAULT_SELECTION", "5"))
 
 
 # --- Reporting -------------------------------------------------------------

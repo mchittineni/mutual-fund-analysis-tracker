@@ -42,7 +42,14 @@ st.set_page_config(
 
 @st.cache_data(ttl=config.CACHE_TTL_SECONDS, show_spinner="Loading fund catalogue…")
 def load_catalogue() -> pd.DataFrame:
-    return db_manager.scheme_catalogue()
+    """The schemes the pickers offer: those holding enough history to analyse.
+
+    Not the whole catalogue. A bootstrap now stores every scheme AMFI publishes
+    (~14,000), but most arrive with a single NAV, and offering a fund whose every
+    metric would come back blank is a worse answer than not offering it. The full
+    count still reaches the user through `catalogue_coverage()`.
+    """
+    return db_manager.search_schemes(with_history_only=True, limit=50_000)
 
 
 @st.cache_data(ttl=config.CACHE_TTL_SECONDS, show_spinner="Computing performance and risk metrics…")
@@ -102,12 +109,22 @@ catalogue = load_catalogue()
 
 if catalogue.empty:
     st.title("📈 Indian Mutual Fund Tracker")
+    stats = catalogue_coverage()
     if boot.status == "failed":
         st.error(f"**Could not load NAV data.** {boot.message}", icon="🚨")
         if st.button("Try again"):
             st.cache_resource.clear()
             st.cache_data.clear()
             st.rerun()
+    elif stats["schemes"]:
+        # The catalogue landed but no scheme has enough NAV history yet -- a real
+        # state on a cold start whose seed fetch failed, and one the old "the
+        # database is empty" message would have described wrongly.
+        st.warning(
+            f"{stats['schemes']:,} scheme(s) are catalogued, but none yet holds the "
+            f"{config.MIN_OBSERVATIONS} observations any metric needs. Fetch history with:\n\n"
+            "```bash\npython -m src.catalogue --backfill 100\n```"
+        )
     else:
         st.warning(
             "The database is empty. Populate it with:\n\n"
@@ -138,7 +155,11 @@ name_to_code = dict(
 selected_names = st.sidebar.multiselect(
     "Schemes to analyse",
     list(name_to_code),
-    default=list(name_to_code)[: min(3, len(name_to_code))],
+    # Seeded with a handful rather than everything: `search_schemes` orders by
+    # observation count, so these are the longest histories available, and each
+    # extra default is a full metric recomputation before the first paint.
+    default=list(name_to_code)[: min(config.DEFAULT_SELECTION_SIZE, len(name_to_code))],
+    help=f"{len(name_to_code):,} scheme(s) have enough history to analyse.",
 )
 selected_codes = tuple(name_to_code[name] for name in selected_names)
 

@@ -85,6 +85,12 @@ AMFI_HOST = os.getenv("MF_AMFI_HOST", "www.amfiindia.com")
 # fetches NAV data on first load when the database is empty. Set to 0 for a
 # deployment that mounts a pre-built database and must never hit the network.
 AUTO_BOOTSTRAP = _env_flag("MF_AUTO_BOOTSTRAP", default=True)
+# Where reads come from: "sqlite" (the local file) or "supabase" (the hosted
+# mirror). Deliberately explicit rather than inferred from MF_REMOTE_URL being
+# set -- the catalogue job sets that URL to *write*, and must go on reading its
+# own local database or its progress numbers would describe the mirror instead
+# of the run it just did. A hosted dashboard sets MF_STORAGE=supabase.
+STORAGE_BACKEND = os.getenv("MF_STORAGE", "sqlite").strip().lower()
 # The bootstrap catalogues the whole AMFI universe before fetching seed history,
 # so a hosted deployment offers every scheme AMFI publishes today rather than the
 # handful hardcoded above. It costs one extra download (~7 MB) on a cold start.

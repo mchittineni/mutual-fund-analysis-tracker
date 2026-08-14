@@ -30,6 +30,7 @@ pasting a string in.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import os
 import sqlite3
@@ -39,6 +40,8 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
+
+import pandas as pd
 
 from src import config
 
@@ -367,6 +370,23 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# Row-level security that blocks a read does not raise -- it returns nothing. A
+# dashboard would render "0 schemes catalogued" and look like a data problem, so
+# the check reports the policy picture alongside the row counts.
+RLS_SQL = """
+    SELECT c.relname,
+           c.relrowsecurity   AS rls_enabled,
+           c.relforcerowsecurity AS rls_forced,
+           pg_get_userbyid(c.relowner) AS owner,
+           (SELECT COUNT(*) FROM pg_policies p
+             WHERE p.schemaname = 'public' AND p.tablename = c.relname) AS policies
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public' AND c.relkind = 'r'
+     ORDER BY c.relname
+"""
+
+
 def check() -> str:
     """Prove the connection string works, without writing anything.
 
@@ -378,22 +398,50 @@ def check() -> str:
         with conn.cursor() as cur:
             cur.execute("SELECT version(), current_database(), current_user")
             version, database, user = cur.fetchone()
-            cur.execute(
-                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
-            )
-            tables = sorted(row[0] for row in cur.fetchall())
+            cur.execute("SELECT rolbypassrls FROM pg_roles WHERE rolname = current_user")
+            row = cur.fetchone()
+            bypasses_rls = bool(row and row[0])
+            cur.execute(RLS_SQL)
+            tables = cur.fetchall()
+
+        names = [t[0] for t in tables]
         lines = [
             f"Connected to {database} as {user}",
             version.split(" on ")[0],
-            f"Tables present: {', '.join(tables) if tables else '(none yet -- the first sync creates them)'}",
+            f"Tables present: {', '.join(names) if names else '(none yet -- the first sync creates them)'}",
         ]
-        if "nav_history" in tables:
+
+        for name, rls, forced, owner, policies in tables:
+            if not rls:
+                continue
+            owns = owner == user
+            # An owner is exempt from its own table's RLS unless FORCE is set;
+            # everyone else needs a policy or the table reads as empty.
+            readable = bypasses_rls or (owns and not forced) or policies > 0
+            verdict = "readable" if readable else "WILL READ AS EMPTY for this user"
+            why = (
+                "bypasses RLS"
+                if bypasses_rls
+                else "owner, not forced"
+                if owns and not forced
+                else f"{policies} policy(ies)"
+                if policies
+                else "no policy, not the owner"
+            )
+            lines.append(f"  {name}: RLS on, {why} -- {verdict}")
+
+        if "nav_history" in names:
             with conn.cursor() as cur:
                 cur.execute("SELECT COUNT(*), MIN(date), MAX(date) FROM nav_history")
                 rows, first, last = cur.fetchone()
                 cur.execute("SELECT COUNT(*) FROM scheme_info")
                 schemes = cur.fetchone()[0]
             lines.append(f"{schemes:,} schemes, {rows:,} NAV rows spanning {first} to {last}")
+            if rows == 0:
+                lines.append(
+                    "0 rows visible. If the sync reported success, this is RLS hiding them, "
+                    "not missing data."
+                )
         return "\n".join(lines)
     finally:
         conn.close()
@@ -427,3 +475,185 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(main())
+
+
+# ---------------------------------------------------------------------------
+# Reads
+# ---------------------------------------------------------------------------
+#
+# The dashboard's four read paths, against Postgres. Written out rather than
+# shared with the SQLite versions because the dialects differ where it matters:
+# Postgres takes %s placeholders instead of ?, and will not let HAVING refer to
+# a SELECT alias. A "portable" query covering both would be less readable than
+# two honest ones.
+#
+# Reads reuse one module-level connection. Streamlit re-runs the whole script on
+# every widget change, and a connection per rerun exhausts the pooler within
+# minutes of ordinary clicking.
+
+_shared = None
+
+
+def reads_enabled() -> bool:
+    """Whether reads should come from Postgres rather than the local SQLite file.
+
+    Explicit, never inferred from the URL being present: the catalogue job sets
+    that URL to *write*, and must keep reading its own local database or its
+    progress numbers would describe the mirror instead of the run.
+    """
+    return config.STORAGE_BACKEND == "supabase"
+
+
+def shared_connection():
+    """A reused connection, reopened if the pooler has dropped it."""
+    global _shared
+    if _shared is not None:
+        try:
+            with _shared.cursor() as cur:
+                cur.execute("SELECT 1")
+            return _shared
+        except Exception:
+            logger.info("Remote connection went stale; reconnecting")
+            with contextlib.suppress(Exception):
+                _shared.close()
+            _shared = None
+    _shared = connect()
+    return _shared
+
+
+def _frame(sql: str, params: Sequence | None = None) -> pd.DataFrame:
+    """Run a query and return a DataFrame.
+
+    Rows are fetched through the driver rather than handed to
+    `pandas.read_sql_query`, which warns on anything that is not a SQLAlchemy
+    connectable and would print that warning into the dashboard's logs on every
+    interaction.
+    """
+    conn = shared_connection()
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        columns = [c.name for c in cur.description]
+        rows = cur.fetchall()
+    return pd.DataFrame(rows, columns=columns)
+
+
+CATALOGUE_SQL = """
+    SELECT s.scheme_code, s.scheme_name, s.fund_house, s.scheme_category,
+           COUNT(n.date)      AS observations,
+           MIN(n.date)        AS first_date,
+           MAX(n.date)        AS last_date,
+           MAX(n.data_source) AS data_source
+      FROM scheme_info s
+      LEFT JOIN nav_history n ON n.scheme_code = s.scheme_code
+     GROUP BY s.scheme_code
+     ORDER BY s.fund_house, s.scheme_name
+"""
+
+
+def scheme_catalogue() -> pd.DataFrame:
+    """One row per scheme with coverage statistics.
+
+    `GROUP BY s.scheme_code` alone is legal here: it is the primary key, so
+    Postgres knows the other scheme_info columns are functionally dependent on it.
+    """
+    return _frame(CATALOGUE_SQL)
+
+
+def search_schemes(
+    *,
+    query: str | None = None,
+    category: str | None = None,
+    fund_house: str | None = None,
+    with_history_only: bool = False,
+    limit: int = 200,
+) -> pd.DataFrame:
+    """Search the catalogue. Mirrors `db_manager.search_schemes`."""
+    sql = [
+        "SELECT s.scheme_code, s.scheme_name, s.fund_house, s.scheme_type,",
+        "       s.scheme_category, COUNT(n.date) AS observations, MAX(n.date) AS last_date",
+        "  FROM scheme_info s",
+        "  LEFT JOIN nav_history n ON n.scheme_code = s.scheme_code",
+        " WHERE 1 = 1",
+    ]
+    params: list[object] = []
+    if query:
+        sql.append(" AND s.scheme_name ILIKE %s")
+        params.append(f"%{query}%")
+    if category:
+        sql.append(" AND s.scheme_category = %s")
+        params.append(category)
+    if fund_house:
+        sql.append(" AND s.fund_house = %s")
+        params.append(fund_house)
+    sql.append(" GROUP BY s.scheme_code")
+    if with_history_only:
+        # Postgres will not accept the `observations` alias here, unlike SQLite.
+        sql.append(" HAVING COUNT(n.date) >= %s")
+        params.append(config.MIN_OBSERVATIONS)
+    sql.append(" ORDER BY observations DESC, s.scheme_name LIMIT %s")
+    params.append(limit)
+    return _frame("\n".join(sql), params)
+
+
+LOAD_SQL = """
+    SELECT n.scheme_code,
+           COALESCE(s.scheme_name, 'Unknown scheme ' || n.scheme_code) AS scheme_name,
+           s.fund_house,
+           s.scheme_category,
+           n.date,
+           n.nav,
+           n.data_source
+      FROM nav_history n
+      LEFT JOIN scheme_info s ON n.scheme_code = s.scheme_code
+"""
+
+
+def load_data(scheme_codes: Sequence[str] | None = None) -> pd.DataFrame:
+    """NAV history joined to metadata, for the schemes asked for.
+
+    Always pass `scheme_codes`. The mirror holds millions of rows, and the whole
+    table is never what a dashboard wants -- the unfiltered form exists only to
+    match the SQLite signature.
+    """
+    sql = LOAD_SQL
+    params: list[object] = []
+    if scheme_codes:
+        # `= ANY(%s)` takes a list directly, so the query text stays fixed no
+        # matter how many schemes are selected.
+        sql += " WHERE n.scheme_code = ANY(%s)"
+        params.append([str(code) for code in scheme_codes])
+    sql += " ORDER BY n.scheme_code, n.date ASC"
+    frame = _frame(sql, params or None)
+    if not frame.empty:
+        # Postgres returns `datetime.date`; every caller downstream expects the
+        # datetime64 column SQLite's parse_dates produced.
+        frame["date"] = pd.to_datetime(frame["date"])
+    return frame
+
+
+STATS_SQL = """
+    SELECT (SELECT COUNT(*) FROM scheme_info)                        AS schemes,
+           (SELECT COUNT(DISTINCT scheme_category) FROM scheme_info) AS categories,
+           (SELECT COUNT(DISTINCT fund_house) FROM scheme_info)      AS fund_houses,
+           (SELECT COUNT(*) FROM (
+                SELECT scheme_code FROM nav_history
+                 GROUP BY scheme_code HAVING COUNT(*) >= %s
+            ) AS q)                                                  AS analysable,
+           (SELECT COUNT(*) FROM nav_history)                        AS nav_rows
+"""
+
+
+def catalogue_stats() -> dict[str, int]:
+    """Headline counts. Reports zeros rather than raising if the mirror is bare."""
+    try:
+        frame = _frame(STATS_SQL, (config.MIN_OBSERVATIONS,))
+    except Exception as exc:
+        # A probe must never be the thing that fails what it measures.
+        logger.warning("Could not read remote catalogue stats: %s", type(exc).__name__)
+        return dict.fromkeys(("schemes", "categories", "fund_houses", "analysable", "nav_rows"), 0)
+    return {key: int(frame.iloc[0][key]) for key in frame.columns}
+
+
+def recent_runs(limit: int = 10) -> pd.DataFrame:
+    """The sync audit trail, newest first -- the mirror's answer to ingestion_runs."""
+    return _frame("SELECT * FROM sync_runs ORDER BY run_id DESC LIMIT %s", (limit,))

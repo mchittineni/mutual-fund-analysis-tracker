@@ -264,8 +264,16 @@ def test_cli_writes_a_summary_file(monkeypatch, tmp_path, local_db):
 # --- connection check ------------------------------------------------------
 
 
-def test_check_reports_the_server_and_its_tables(monkeypatch):
-    """The pre-flight a bad URI should fail on, instead of a 45-minute CI job."""
+def checker(monkeypatch, *, user="postgres", bypass=False, tables=None, rows=3_044_902):
+    """A fake server for `check()`. `tables` rows are (name, rls, forced, owner, policies)."""
+    table_rows = (
+        tables
+        if tables is not None
+        else [
+            ("nav_history", True, False, "postgres", 0),
+            ("scheme_info", True, False, "postgres", 0),
+        ]
+    )
 
     class CheckCursor(FakeCursor):
         def __init__(self, log):
@@ -276,11 +284,13 @@ def test_check_reports_the_server_and_its_tables(monkeypatch):
             text = rendered(statement)
             self.log.append((text, params))
             if "version()" in text:
-                self._result = ("PostgreSQL 17.4 on aarch64", "postgres", "postgres")
-            elif "information_schema" in text:
-                self.rows = [("nav_history",), ("scheme_info",)]
+                self._result = ("PostgreSQL 17.4 on aarch64", "postgres", user)
+            elif "rolbypassrls" in text:
+                self._result = (bypass,)
+            elif "pg_class" in text:
+                self.rows = table_rows
             elif "FROM nav_history" in text:
-                self._result = (3_044_902, "2021-08-14", "2026-08-13")
+                self._result = (rows, "2021-08-14", "2026-08-13")
             elif "FROM scheme_info" in text:
                 self._result = (14273,)
             return self
@@ -293,6 +303,11 @@ def test_check_reports_the_server_and_its_tables(monkeypatch):
             return CheckCursor(self.log)
 
     monkeypatch.setattr(remote_store, "connect", lambda *_a, **_k: CheckConnection())
+
+
+def test_check_reports_the_server_and_its_tables(monkeypatch):
+    """The pre-flight a bad URI should fail on, instead of a 45-minute CI job."""
+    checker(monkeypatch)
     report = remote_store.check()
     assert "Connected to postgres as postgres" in report
     assert "PostgreSQL 17.4" in report
@@ -300,6 +315,223 @@ def test_check_reports_the_server_and_its_tables(monkeypatch):
     assert "3,044,902 NAV rows" in report
 
 
+def test_check_clears_rls_for_the_table_owner(monkeypatch):
+    """RLS is enabled but the owner is exempt, so the data is still readable."""
+    checker(monkeypatch, user="postgres")
+    report = remote_store.check()
+    assert "owner, not forced -- readable" in report
+    assert "WILL READ AS EMPTY" not in report
+
+
+def test_check_warns_when_rls_would_hide_everything(monkeypatch):
+    """The failure this catches returns zero rows rather than an error.
+
+    A read-only role with no SELECT policy makes the dashboard render "0 schemes
+    catalogued", which looks like missing data and is not.
+    """
+    checker(
+        monkeypatch,
+        user="dashboard_reader",
+        tables=[("nav_history", True, False, "postgres", 0)],
+        rows=0,
+    )
+    report = remote_store.check()
+    assert "WILL READ AS EMPTY" in report
+    assert "no policy, not the owner" in report
+    assert "this is RLS hiding them" in report
+
+
+def test_check_accepts_a_policy_as_sufficient(monkeypatch):
+    checker(
+        monkeypatch,
+        user="dashboard_reader",
+        tables=[("nav_history", True, False, "postgres", 1)],
+    )
+    report = remote_store.check()
+    assert "1 policy(ies) -- readable" in report
+
+
 def test_check_exits_two_when_the_url_is_missing(monkeypatch):
     monkeypatch.delenv(remote_store.REMOTE_URL_ENV, raising=False)
     assert remote_store.main(["--check", "--log-level", "CRITICAL"]) == 2
+
+
+# --- reads -----------------------------------------------------------------
+
+
+class ReadCursor(FakeCursor):
+    """A cursor that answers with a fixed result set and records the SQL."""
+
+    def __init__(self, log, columns, rows):
+        super().__init__(log)
+        self.columns = columns
+        self.rows = rows
+
+    def execute(self, statement, params=None):
+        self.log.append((rendered(statement), params))
+        return self
+
+    @property
+    def description(self):
+        return [type("Col", (), {"name": name})() for name in self.columns]
+
+    def fetchall(self):
+        return self.rows
+
+
+def reader(monkeypatch, columns, rows):
+    """Point remote_store's shared connection at a canned result set."""
+    log = []
+
+    class Conn:
+        def cursor(self):
+            return ReadCursor(log, columns, rows)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(remote_store, "shared_connection", lambda: Conn())
+    return log
+
+
+def test_reads_are_off_unless_explicitly_switched_on(monkeypatch):
+    """Setting the URL means 'write here', not 'read from here'.
+
+    The catalogue job sets it to push, and must go on reading its own local
+    database -- otherwise its before/after progress numbers would describe the
+    mirror rather than the run it just did.
+    """
+    monkeypatch.setenv(remote_store.REMOTE_URL_ENV, "postgresql://x/y")
+    monkeypatch.setattr(remote_store.config, "STORAGE_BACKEND", "sqlite")
+    assert remote_store.reads_enabled() is False
+    monkeypatch.setattr(remote_store.config, "STORAGE_BACKEND", "supabase")
+    assert remote_store.reads_enabled() is True
+
+
+def test_load_data_filters_by_scheme_and_returns_datetimes(monkeypatch):
+    log = reader(
+        monkeypatch,
+        [
+            "scheme_code",
+            "scheme_name",
+            "fund_house",
+            "scheme_category",
+            "date",
+            "nav",
+            "data_source",
+        ],
+        [("100001", "A Fund", "A AMC", "ELSS", date(2026, 8, 13), 42.0, "amfi")],
+    )
+    frame = remote_store.load_data(["100001"])
+    sql, params = log[0]
+    assert "= ANY(%s)" in sql
+    assert params == [["100001"]]
+    # SQLite's parse_dates produced datetime64; Postgres hands back date objects,
+    # and every caller downstream expects the former.
+    assert str(frame["date"].dtype).startswith("datetime64")
+
+
+def test_search_repeats_the_count_instead_of_using_the_alias(monkeypatch):
+    """Postgres rejects a SELECT alias in HAVING, unlike SQLite."""
+    log = reader(monkeypatch, ["scheme_code"], [])
+    remote_store.search_schemes(with_history_only=True, limit=5)
+    sql, params = log[0]
+    assert "HAVING COUNT(n.date) >= %s" in sql
+    assert "HAVING observations" not in sql
+    assert params[-1] == 5
+
+
+def test_search_uses_case_insensitive_matching(monkeypatch):
+    log = reader(monkeypatch, ["scheme_code"], [])
+    remote_store.search_schemes(query="bluechip")
+    sql, params = log[0]
+    assert "ILIKE" in sql
+    assert "%bluechip%" in params
+
+
+def test_catalogue_stats_returns_zeros_when_the_mirror_is_unreadable(monkeypatch):
+    """A probe must never be the thing that fails what it measures."""
+
+    def explode():
+        raise RuntimeError("relation does not exist")
+
+    monkeypatch.setattr(remote_store, "shared_connection", explode)
+    stats = remote_store.catalogue_stats()
+    assert stats == {
+        "schemes": 0,
+        "categories": 0,
+        "fund_houses": 0,
+        "analysable": 0,
+        "nav_rows": 0,
+    }
+
+
+def test_catalogue_stats_shape_matches_the_sqlite_one(monkeypatch):
+    reader(
+        monkeypatch,
+        ["schemes", "categories", "fund_houses", "analysable", "nav_rows"],
+        [(14273, 87, 52, 2526, 3527399)],
+    )
+    assert remote_store.catalogue_stats() == {
+        "schemes": 14273,
+        "categories": 87,
+        "fund_houses": 52,
+        "analysable": 2526,
+        "nav_rows": 3527399,
+    }
+
+
+def test_a_dropped_connection_is_reopened(monkeypatch):
+    """Supabase's pooler closes idle connections; a rerun must not surface that."""
+    opened = []
+
+    class Dead:
+        def cursor(self):
+            raise OSError("server closed the connection unexpectedly")
+
+        def close(self):
+            pass
+
+    class Live:
+        def cursor(self):
+            return ReadCursor([], ["one"], [(1,)])
+
+        def close(self):
+            pass
+
+    def fake_connect(*_a, **_k):
+        opened.append(1)
+        return Live()
+
+    monkeypatch.setattr(remote_store, "_shared", Dead())
+    monkeypatch.setattr(remote_store, "connect", fake_connect)
+    assert remote_store.shared_connection() is not None
+    assert opened == [1]
+
+
+# --- the db_manager seam ---------------------------------------------------
+
+
+def test_db_manager_delegates_reads_when_the_backend_is_supabase(monkeypatch, local_db):
+    """The branch belongs at the boundary; nothing upstream should know."""
+    called = {}
+
+    def fake_load(codes=None):
+        called["codes"] = codes
+        return "remote frame"
+
+    monkeypatch.setattr(remote_store.config, "STORAGE_BACKEND", "supabase")
+    monkeypatch.setattr(remote_store, "load_data", fake_load)
+    assert db_manager.load_data(local_db, ["100001"]) == "remote frame"
+    assert called["codes"] == ["100001"]
+
+
+def test_db_manager_reads_sqlite_by_default(monkeypatch, local_db):
+    monkeypatch.setattr(remote_store.config, "STORAGE_BACKEND", "sqlite")
+
+    def explode(*_a, **_k):
+        raise AssertionError("read the mirror despite MF_STORAGE=sqlite")
+
+    monkeypatch.setattr(remote_store, "load_data", explode)
+    frame = db_manager.load_data(local_db)
+    assert len(frame) == 2

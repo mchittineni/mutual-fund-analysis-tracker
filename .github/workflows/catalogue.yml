@@ -110,12 +110,21 @@ jobs:
           # The command appends its own coverage tables to the job summary.
           python -m src.catalogue "${args[@]}"
 
-      - name: Publish to the hosted database
-        if: always()
-        env:
-          MF_REMOTE_URL: ${{ secrets.MF_REMOTE_URL }}
-          MF_REMOTE_HISTORY_YEARS: ${{ vars.MF_REMOTE_HISTORY_YEARS || '5' }}
-        run: python -m src.remote_store --log-level INFO --summary-file "$GITHUB_STEP_SUMMARY"
+      # Disabled: the Supabase mirror is off. The connection kept failing
+      # (`could not connect to the remote database: OperationalError`, exit 2),
+      # which turned an otherwise successful catalogue refresh red. The run's
+      # own storage is enough on its own: the "Save the NAV database" cache
+      # entry is what the next run restores, and "Upload the database"
+      # publishes the same file as a downloadable artifact.
+      #
+      # To bring the mirror back, uncomment this step and set the
+      # MF_REMOTE_URL secret to a reachable Postgres URI.
+      # - name: Publish to the hosted database
+      #   if: always()
+      #   env:
+      #     MF_REMOTE_URL: ${{ secrets.MF_REMOTE_URL }}
+      #     MF_REMOTE_HISTORY_YEARS: ${{ vars.MF_REMOTE_HISTORY_YEARS || '5' }}
+      #   run: python -m src.remote_store --log-level INFO --summary-file "$GITHUB_STEP_SUMMARY"
 
       - name: Report what this run added
         if: always()

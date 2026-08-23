@@ -357,10 +357,12 @@ is enabled the publish job is skipped, and the summary plus artifacts still work
 1. **Refresh the catalogue** — one request, every scheme, metadata plus the day's NAV.
 2. **Backfill a slice of history** — stopping at a 45-minute budget so the job ends gracefully with
    its work saved rather than being killed at the runner timeout.
-3. **Publish to the hosted database** — the step that makes any of it reachable from the dashboard.
-   It runs on `always()`, because a partial catalogue is still worth mirroring, and it is a no-op
-   when the `MF_REMOTE_URL` secret is unset. A missing configuration exits 0 rather than failing:
-   a red job for an optional feature only teaches people to ignore red jobs.
+3. ~~**Publish to the hosted database**~~ — commented out. The Supabase connection kept failing
+   (`could not connect to the remote database: OperationalError`, exit 2) and turned otherwise
+   successful catalogue refreshes red, so storage is GitHub Actions only for now: the Actions cache
+   carries the database between runs, and the uploaded artifact is the downloadable copy. The step
+   is left in place in the workflow, commented, and only needs a reachable `MF_REMOTE_URL` to come
+   back.
 
 It runs four times a day rather than once, because the backfill is the bottleneck: the catalogue
 only changes when AMFI publishes, but history is one request per scheme.

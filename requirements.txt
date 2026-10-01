@@ -7,7 +7,7 @@ requests>=2.34.2
 # Hosted Postgres mirror (Supabase). Optional at runtime -- src/remote_store.py
 # imports it lazily and reports a clear error if it is missing -- but it is
 # installed by default so the catalogue job and the dashboard share one lockfile.
-psycopg[binary]>=3.2
+psycopg[binary]>=3.3.6
 
 # Dashboard (optional -- the pipeline and reports work without these)
 streamlit>=1.61.1
